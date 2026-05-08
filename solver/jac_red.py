@@ -4,61 +4,94 @@ import sys
 import numpy as np
 from scipy.sparse import coo_matrix
 
+
 class domain_reduction(object):
-    """docstring for domain_reduction."""
+    """
+    Restricts a matrix/vector to a spatial subdomain defined by
+    [xmin, xmax] x [zmin, zmax].
+
+    Optimised version: all O(n) Python loops replaced with vectorised
+    numpy operations; matrix reduction uses direct index slicing instead
+    of two full sparse matrix multiplications.
+    """
+
     def __init__(self, zmin, zmax, xmin, xmax):
         super(domain_reduction, self).__init__()
         self.zmin = zmin
         self.zmax = zmax
         self.xmin = xmin
         self.xmax = xmax
-        self.P = None
-        self.PO = None
-        self.POT = None
-        self.m = None
-        pass
+        # kept_idx  : indices of DOFs inside the subdomain (sorted)
+        # reorder   : full permutation index array (inside first, outside after)
+        self.kept_idx = None
+        self.reorder  = None
+        self.m        = None   # number of DOFs inside subdomain
 
     def create_Pmatrix(self, coords):
-        """Generates the permutation matrix using the coordinates numpy array
-           and the coordinates limits defined on the object construction."""
+        """
+        Build the index arrays that define the subdomain restriction.
+
+        Instead of constructing an explicit permutation matrix and storing
+        PO / POT (which cost memory and require two O(nnz) sparse multiplies
+        in reduce_matrix), we store only the integer index arrays and use
+        direct CSR row/column slicing.
+
+        Parameters
+        ----------
+        coords : ndarray, shape (nvar, ndim)
+            Coordinate array as returned by read_coordinates.
+            coords[:, 0] = x,  coords[:, 1] = z
+        """
         nvar = coords.shape[0]
-        self.P = coo_matrix((nvar,nvar))
-        self.P.data = np.ones(nvar)
-        self.P.row  = np.zeros(nvar, dtype='i4')
-        self.P.col  = np.zeros(nvar, dtype='i4')
 
-        ii = 0; jj = 1
-        for i in range(nvar):
-            if (coords[i,1] > self.zmin) and (coords[i,1] < self.zmax) \
-                and (coords[i,0] > self.xmin) and (coords[i,0] < self.xmax):
-                self.P.row[i] = ii
-                self.P.col[i] = i
-                ii += 1
-            else:
-                self.P.row[i] = nvar - jj
-                self.P.col[i] = i
-                jj += 1
+        # ── Vectorised mask — replaces the Python for-loop ────────────────
+        x = coords[:, 0]
+        z = coords[:, 1]
+        inside = (x > self.xmin) & (x < self.xmax) & \
+                 (z > self.zmin) & (z < self.zmax)
 
-        self.PO = self.P.tocsr()
-        self.POT = self.P.tocsr().transpose()
-        self.P = None
-        self.m = ii
+        # Indices of DOFs inside and outside the subdomain
+        self.kept_idx = np.where(inside)[0]          # shape (m,)
+        outside_idx   = np.where(~inside)[0]         # shape (nvar-m,)
+
+        # Full permutation order: inside first, then outside
+        # (kept for reduce_vector compatibility)
+        self.reorder = np.concatenate([self.kept_idx, outside_idx])
+
+        self.m = int(self.kept_idx.size)
         print(' New dim = ', self.m, ' Current dim = ', nvar)
         print('')
-        pass
 
-    def reduce_matrix(self,A):
-        """Reorder the matrix A with the permutation matrices and extracts a new
-           reduced matrix C."""
-        B = self.PO * A * self.POT
-        C = B.tocsr()[0:self.m,:].tocsc()[:,0:self.m]
-        B=None
-        return C.tocsr()
+    def reduce_matrix(self, A):
+        """
+        Extract the submatrix of A corresponding to the subdomain DOFs.
 
-    def reduce_vector(self,V):
-        """Reorder a vector V and return only the reduced version of it."""
-        newV = self.PO.dot(V)
-        return newV[:self.m]
-        
-#def adapt_coord(coordfile):
-#    with open(coordfile)
+        Uses direct CSR row slicing followed by CSC column slicing — much
+        faster than two full sparse matrix multiplications (PO * A * POT).
+
+        Parameters
+        ----------
+        A : scipy sparse matrix (any format)
+
+        Returns
+        -------
+        scipy.sparse.csr_matrix of shape (m, m)
+        """
+        idx = self.kept_idx
+        # Row slicing is O(m + nnz_selected) on CSR
+        # Column slicing is O(m + nnz_selected) on CSC
+        return A.tocsr()[idx, :].tocsc()[:, idx].tocsr()
+
+    def reduce_vector(self, V):
+        """
+        Return only the entries of V corresponding to subdomain DOFs.
+
+        Parameters
+        ----------
+        V : 1-D array of length nvar
+
+        Returns
+        -------
+        1-D array of length m
+        """
+        return np.asarray(V)[self.kept_idx]
