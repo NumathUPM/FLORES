@@ -6,6 +6,7 @@
 import numpy as np
 import sys, os
 import time
+import gc
 import configparser
 from scipy.sparse import csr_matrix, identity
 from jac_red import domain_reduction
@@ -44,11 +45,13 @@ def read_control_file(filepath):
         [io]
             input_path          : path to Jacobian and volume files
             output_path         : path for output files
+            coord_file          : coordinates filename (default: samg.matrix.coo)
 
         [physics]
             mach                : Mach number
             beta                : spanwise wavenumber (0 for 2D)
             nslices             : number of slices (only used if beta != 0)
+            rlength             : reference length (default: 1.0)
 
         [frequencies]
             omega_start         : start of frequency range (imaginary part)
@@ -61,8 +64,12 @@ def read_control_file(filepath):
             shift               : spectral shift (real)
             compute_sensitivity : True/False
 
-        [mumps]
-            ordering            : scotch (default), metis, auto, amd
+        [domain_reduction]
+            enabled             : apply domain reduction? (default: False)
+            xmin                : x lower bound
+            xmax                : x upper bound
+            zmin                : z lower bound
+            zmax                : z upper bound
     """
     if not os.path.isfile(filepath):
         raise FileNotFoundError('Control file not found: {0}'.format(filepath))
@@ -75,23 +82,38 @@ def read_control_file(filepath):
     # [io]
     params['input_path']  = cfg.get('io', 'input_path').strip()
     params['output_path'] = cfg.get('io', 'output_path').strip()
+    params['coord_file']  = cfg.get('io', 'coord_file',
+                                    fallback='samg.matrix.coo').strip()
 
     # [physics]
     params['mach']    = cfg.getfloat('physics', 'mach')
-    params['beta']    = cfg.getfloat('physics', 'beta')
-    params['nslices'] = cfg.getint('physics', 'nslices')
+    params['beta']    = cfg.getfloat('physics', 'beta',    fallback=0.0)
+    params['nslices'] = cfg.getint  ('physics', 'nslices', fallback=7)
+    params['rlength'] = cfg.getfloat('physics', 'rlength', fallback=1.0)
 
     # [frequencies]
     omega_start = cfg.getfloat('frequencies', 'omega_start')
     omega_end   = cfg.getfloat('frequencies', 'omega_end')
-    omega_n     = cfg.getint('frequencies',   'omega_n')
+    omega_n     = cfg.getint  ('frequencies', 'omega_n')
     params['listomegas'] = list(np.linspace(omega_start*1j, omega_end*1j, omega_n))
 
     # [solver]
-    params['nev']                 = cfg.getint('solver',     'nev')
-    params['ncv']                 = cfg.getint('solver',     'ncv')
-    params['shift']               = cfg.getfloat('solver',   'shift')
-    params['compute_sensitivity'] = cfg.getboolean('solver', 'compute_sensitivity')
+    params['nev']                 = cfg.getint    ('solver', 'nev')
+    params['ncv']                 = cfg.getint    ('solver', 'ncv')
+    params['shift']               = cfg.getfloat  ('solver', 'shift')
+    params['adjoint']             = cfg.getboolean('solver', 'adjoint',             fallback=False)
+    params['compute_sensitivity'] = cfg.getboolean('solver', 'compute_sensitivity', fallback=False)
+
+    # sensitivity requires adjoint — enforce it
+    if params['compute_sensitivity'] and not params['adjoint']:
+        params['adjoint'] = True
+
+    # [domain_reduction]
+    params['dreduced'] = cfg.getboolean('domain_reduction', 'enabled', fallback=False)
+    params['xmin']     = cfg.getfloat  ('domain_reduction', 'xmin',    fallback=0.0)
+    params['xmax']     = cfg.getfloat  ('domain_reduction', 'xmax',    fallback=1.0)
+    params['zmin']     = cfg.getfloat  ('domain_reduction', 'zmin',    fallback=-1.0)
+    params['zmax']     = cfg.getfloat  ('domain_reduction', 'zmax',    fallback=1.0)
 
     return params
 
@@ -136,9 +158,7 @@ class resolvant(object):
         y.conjugate()
 
     def operator(self, w):
-        """Build L = iw*I - A and perform LU factorization via MUMPS.
-        MUMPS reads OMP_NUM_THREADS from environment automatically.
-        """
+        """Build L = iw*I - A and perform LU factorization via MUMPS."""
         Print = PETSc.Sys.Print
         Print(' w = {0}'.format(w))
         self.J.scale(-1.0)
@@ -160,11 +180,19 @@ class resolvant(object):
         Print('')
         self.ksp.setUp()
 
+    def cleanup(self):
+        if self.ksp is not None:
+            self.ksp.destroy()
+            self.ksp = None
+        if self.P is not None:
+            self.P.destroy()
+            self.P = None
+        self.J = None; self.Q = None; self.Minv = None
+
     def pcreate(self, neq):
         """Build prolongation matrix P."""
         comm  = MPI.COMM_WORLD
         size  = comm.Get_size()
-        rank  = comm.Get_rank()
         Print = PETSc.Sys.Print
 
         dimrows = self.N
@@ -234,6 +262,9 @@ class resolvant_adjoint(object):
         self.iter += 1
         v1.destroy(); v2.destroy(); tmp.destroy()
 
+    def cleanup(self):
+        self.ksp = None; self.Q = None; self.Minv = None; self.P = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sensitivity
@@ -275,6 +306,9 @@ def compute_sensitivity_field(direct_vec, adjoint_vec, B, nvars, n, neq,
         mode2pval(outfile, wm_petsc, nvars, n, neq, beta, dreduced, rgid)
         wm_petsc.destroy()
 
+    scatter_d.destroy(); dir_seq.destroy()
+    scatter_a.destroy(); adj_seq.destroy()
+    scatter_t.destroy(); tmp_seq.destroy()
     tmp_vec.destroy()
 
 
@@ -346,19 +380,25 @@ def run_slices(params):
     mach                = params['mach']
     beta                = params['beta']
     nslices             = params['nslices']
+    rlength             = params['rlength']
     listomegas          = params['listomegas']
     nev                 = params['nev']
     ncv                 = params['ncv']
     shift               = params['shift']
+    adjoint             = params['adjoint']
     compute_sensitivity = params['compute_sensitivity']
-    rlength             = 1.0
-    dreduced            = False
+    dreduced            = params['dreduced']
+    xmin                = params['xmin'];  xmax = params['xmax']
+    zmin                = params['zmin'];  zmax = params['zmax']
 
     jacfile = os.path.join(input_path, 'samg.matrix.amg.pval')
     volfile = os.path.join(input_path, 'samg.matrix.vol')
+    coofile = os.path.join(input_path, params['coord_file'])
 
-    if not os.path.isdir(output_path):
-        os.mkdir(output_path)
+    if rank == 0:
+        if not os.path.isdir(output_path):
+            os.mkdir(output_path)
+    comm.Barrier()  # all ranks wait until rank 0 has created the output dir
 
     # ── Print run summary ────────────────────────────────────────────────────
     Print('')
@@ -370,15 +410,21 @@ def run_slices(params):
     Print(' Mach        : {0}'.format(mach))
     Print(' beta        : {0}'.format(beta))
     Print(' nev         : {0}'.format(nev))
+    Print(' ncv         : {0}'.format(ncv))
     Print(' shift       : {0}'.format(shift))
+    Print(' Adjoint     : {0}'.format(adjoint))
     Print(' Sensitivity : {0}'.format(compute_sensitivity))
+    Print(' Dom. reduc. : {0}'.format(dreduced))
+    if dreduced:
+        Print(' XMIN/XMAX   : {0} / {1}'.format(xmin, xmax))
+        Print(' ZMIN/ZMAX   : {0} / {1}'.format(zmin, zmax))
     Print(' Frequencies : {0}'.format(listomegas))
     Print(' MPI ranks   : {0}'.format(nproc))
     Print(' OMP threads : {0}'.format(os.environ.get('OMP_NUM_THREADS', '1')))
     Print(' ========================================')
     Print('')
 
-    # ── Read Jacobian (rank 0 only, then Bcast) ──────────────────────────────
+    # ── Read Jacobian ────────────────────────────────────────────────────────
     t0 = time.time()
     Print(' Reading Jacobian')
     if rank == 0:
@@ -395,12 +441,13 @@ def run_slices(params):
             Print(' J0 block main dimension = {0}'.format(nvars))
             Ly = 1
             Print(' Extracting and compacting Jacobian')
-            midrow = mjac[nvars*3:nvars*4, :].tocsc()
-            jm1 = midrow[:, nvars*2:nvars*3]
-            j0  = midrow[:, nvars*3:nvars*4]
-            j1  = midrow[:, nvars*4:nvars*5]
+            midrow  = mjac[nvars*3:nvars*4, :].tocsc()
+            jm1     = midrow[:, nvars*2:nvars*3]
+            j0      = midrow[:, nvars*3:nvars*4]
+            j1      = midrow[:, nvars*4:nvars*5]
             amatrix = j0 + j1*np.exp(1j*beta*Ly) - j1*np.exp(-1j*beta*Ly)
             amatrix = amatrix.tocsr()
+            del midrow, jm1, j0, j1
 
         n   = amatrix.shape[0]
         nnz = amatrix.nnz
@@ -408,15 +455,14 @@ def run_slices(params):
     else:
         meta = np.empty(4, dtype=np.int64)
 
-    # Broadcast metadata
     comm.Bcast(meta, root=0)
     neq, nvars, n, nnz = int(meta[0]), int(meta[1]), int(meta[2]), int(meta[3])
 
-    # Broadcast CSR arrays using MPI buffer protocol (no pickle)
     if rank == 0:
         indptr_buf  = amatrix.indptr.astype(np.int32)
         indices_buf = amatrix.indices.astype(np.int32)
         data_buf    = amatrix.data.astype(np.complex128)
+        del amatrix, mjac
     else:
         indptr_buf  = np.empty(n + 1, dtype=np.int32)
         indices_buf = np.empty(nnz,   dtype=np.int32)
@@ -426,14 +472,13 @@ def run_slices(params):
     comm.Bcast(indices_buf, root=0)
     comm.Bcast(data_buf,    root=0)
 
-    amatrix = csr_matrix((data_buf, indices_buf, indptr_buf), shape=(n, n))
-
+    amatrix    = csr_matrix((data_buf, indices_buf, indptr_buf), shape=(n, n))
     gridpoints = n // neq
     _t(comm, rank, 'Jacobian read', t0)
 
-    # ── Mass matrix — vectorizado con numpy ──────────────────────────────────
+    # ── Mass matrix ──────────────────────────────────────────────────────────
     t0 = time.time()
-    Print(' Reading mass matrix and generating M, Inv(M), Q')
+    Print(' Reading mass matrix')
     if rank == 0:
         with open(volfile, 'r') as f:
             vols_buf = np.array([float(line) for line in f.readlines()],
@@ -447,9 +492,8 @@ def run_slices(params):
         vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
     comm.Bcast(vols_buf, root=0)
 
-    # Vectorizado: np.repeat en lugar de list comprehension
-    one = 1. + 0j
     vols_repeated = np.repeat(vols_buf, neq)
+    del vols_buf
 
     bmatrix  = identity(n, dtype='c16', format='csr')
     mmatinv  = identity(n, dtype='c16', format='csr')
@@ -457,43 +501,105 @@ def run_slices(params):
     bmatrix.data[:]  = vols_repeated.astype(np.complex128)
     mmatinv.data[:]  = (1.0 / vols_repeated).astype(np.complex128)
     qematrix.data[:] = vols_repeated.astype(np.complex128)
+    del vols_repeated
     _t(comm, rank, 'Mass matrix build', t0)
 
-    # ── Domain reduction ─────────────────────────────────────────────────────
-    t0 = time.time()
+    # ── Domain reduction — rank 0 only, then broadcast ───────────────────────
+    t0   = time.time()
     rgid = None
     if dreduced:
         Print(' Applying domain reduction')
-        coord = read_coordinates('coord.dat', rlength, beta)
-        dr = domain_reduction(0, 0.5, -0.4, 1.0)
-        dr.create_Pmatrix(coord)
-        amatrix  = dr.reduce_matrix(amatrix)
-        bmatrix  = dr.reduce_matrix(bmatrix)
-        qematrix = dr.reduce_matrix(qematrix)
-        mmatinv  = dr.reduce_matrix(mmatinv)
-        n = amatrix.shape[0]
-        localid = np.repeat(np.arange(0, gridpoints, 1, dtype='i4'), neq)
-        rgid    = dr.reduce_vector(localid)[0::neq].astype(int)
+        Print(' XMIN/XMAX = {0}/{1}'.format(xmin, xmax))
+        Print(' ZMIN/ZMAX = {0}/{1}'.format(zmin, zmax))
+
+        if rank == 0:
+            coord = read_coordinates(coofile, rlength, beta)
+            dr    = domain_reduction(zmin, zmax, xmin, xmax)
+            dr.create_Pmatrix(coord)
+
+            nnz_before = amatrix.nnz
+            amatrix    = dr.reduce_matrix(amatrix)
+            bmatrix    = dr.reduce_matrix(bmatrix)
+            qematrix   = dr.reduce_matrix(qematrix)
+            mmatinv    = dr.reduce_matrix(mmatinv)
+            n_red      = amatrix.shape[0]
+
+            localid = np.repeat(np.arange(0, gridpoints, 1, dtype='i4'), neq)
+            rgid    = dr.reduce_vector(localid)[0::neq].astype(int)
+            del localid
+
+            Print(' Previous NNZ = {0}'.format(nnz_before))
+            Print(' New NNZ      = {0}'.format(amatrix.nnz))
+            Print(' New leading dimension = {0}'.format(n_red))
+            Print('')
+
+            # Pack for broadcast
+            a_indptr  = amatrix.indptr.astype(np.int32)
+            a_indices = amatrix.indices.astype(np.int32)
+            a_data    = amatrix.data.astype(np.complex128)
+            b_data    = bmatrix.data.astype(np.complex128)
+            q_data    = qematrix.data.astype(np.complex128)
+            bi_data   = mmatinv.data.astype(np.complex128)
+            meta_dr   = np.array([n_red, amatrix.nnz, len(rgid)],
+                                  dtype=np.int64)
+        else:
+            meta_dr   = np.empty(3,  dtype=np.int64)
+            a_indptr  = None; a_indices = None; a_data  = None
+            b_data    = None; q_data    = None; bi_data = None
+            rgid      = None
+
+        # Broadcast metadata
+        comm.Bcast(meta_dr, root=0)
+        n_red, nnz_red, ngrid_red = (int(meta_dr[0]),
+                                     int(meta_dr[1]),
+                                     int(meta_dr[2]))
+
+        # Broadcast sparse arrays
+        if rank != 0:
+            a_indptr  = np.empty(n_red + 1, dtype=np.int32)
+            a_indices = np.empty(nnz_red,   dtype=np.int32)
+            a_data    = np.empty(nnz_red,   dtype=np.complex128)
+            b_data    = np.empty(n_red,     dtype=np.complex128)
+            q_data    = np.empty(n_red,     dtype=np.complex128)
+            bi_data   = np.empty(n_red,     dtype=np.complex128)
+            rgid      = np.empty(ngrid_red, dtype=np.int64)
+
+        comm.Bcast(a_indptr,  root=0)
+        comm.Bcast(a_indices, root=0)
+        comm.Bcast(a_data,    root=0)
+        comm.Bcast(b_data,    root=0)
+        comm.Bcast(q_data,    root=0)
+        comm.Bcast(bi_data,   root=0)
+        comm.Bcast(rgid,      root=0)
+
+        # Reconstruct scipy matrices on all ranks
+        amatrix  = csr_matrix((a_data, a_indices, a_indptr),
+                               shape=(n_red, n_red))
+        bmatrix  = identity(n_red, dtype='c16', format='csr')
+        qematrix = identity(n_red, dtype='c16', format='csr')
+        mmatinv  = identity(n_red, dtype='c16', format='csr')
+        bmatrix.data[:]  = b_data
+        qematrix.data[:] = q_data
+        mmatinv.data[:]  = bi_data
+
+        n    = n_red
+        rgid = rgid.astype(int)
+
     _t(comm, rank, 'Domain reduction', t0)
 
     # ── Assemble PETSc matrices ───────────────────────────────────────────────
-    t0 = time.time()
+    t0  = time.time()
     fac = 1. / (mach * np.sqrt(1.4))
-
-    # A: escalar antes de ensamblar para evitar una pasada extra
     amatrix_scaled      = amatrix.copy()
     amatrix_scaled.data *= fac
 
-    A    = make_petsc_mat(amatrix_scaled, n, 'A (Jacobian)', PETSc.COMM_WORLD)
-    B    = make_diag_petsc(bmatrix.data,  n, 'B (mass)',     PETSc.COMM_WORLD)
+    A    = make_petsc_mat(amatrix_scaled, n, 'A (Jacobian)',        PETSc.COMM_WORLD)
+    B    = make_diag_petsc(bmatrix.data,  n, 'B (mass)',            PETSc.COMM_WORLD)
     Binv = make_diag_petsc(mmatinv.data,  n, 'Binv (mass inverse)', PETSc.COMM_WORLD)
-    Q    = make_petsc_mat(qematrix, n, 'Q (energy weight)', PETSc.COMM_WORLD)
+    Q    = make_petsc_mat(qematrix,        n, 'Q (energy weight)',   PETSc.COMM_WORLD)
 
-    # Liberar memoria scipy — ya no necesaria
-    amatrix_scaled = None
-    bmatrix        = None
-    mmatinv        = None
-    qematrix       = None
+    del amatrix_scaled, bmatrix, mmatinv, qematrix, amatrix
+    gc.collect()
     _t(comm, rank, 'PETSc matrix assembly', t0)
 
     # ── Frequency loop ────────────────────────────────────────────────────────
@@ -506,12 +612,9 @@ def run_slices(params):
         Print('  omega {0}/{1} = {2}'.format(i_omega+1, len(listomegas), omega))
         Print(' ========================================')
 
-        # ── LU factorization — compartida por directo y adjunto ───────────────
-        t0 = time.time()
-
-        # Necesitamos una copia de A para cada omega (J.scale modifica in-place)
+        # ── LU factorization ─────────────────────────────────────────────────
+        t0      = time.time()
         A_omega = A.copy()
-
         R = PETSc.Mat().create()
         R.setSizes([n//2, n//2])
         R.setType('python')
@@ -543,8 +646,9 @@ def run_slices(params):
         _t(comm, rank, '  Direct EPS solve', t0)
 
         nconv = E.getConverged()
+        nsave = min(nconv, nev)
         if rank == 0:
-            print(' Converged direct eigenvalues: ', nconv)
+            print(' Converged: {0}  /  Saving: {1}'.format(nconv, nsave))
 
         xr,      _ = shell.P.getVecs()
         xi,      _ = shell.P.getVecs()
@@ -555,10 +659,9 @@ def run_slices(params):
 
         # ── Save direct modes ─────────────────────────────────────────────────
         t0 = time.time()
-        if nconv > 0:
+        if nsave > 0:
             Print("           k           ||Ax-kx||/||kx|| ")
             Print("--------------------- ------------------")
-            nsave = min(nconv, nev)
             for i in range(nsave):
                 k     = E.getEigenpair(i, xr, xi)
                 error = E.computeError(i)
@@ -575,7 +678,9 @@ def run_slices(params):
                 scatter, eigenvec = PETSc.Scatter.toZero(eigpre)
                 scatter.scatter(eigpre, eigenvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
-                    mode2pval(eigvecfile, eigenvec, nvars, n, neq, beta, dreduced, rgid)
+                    mode2pval(eigvecfile, eigenvec, nvars, n, neq,
+                              beta, dreduced, rgid)
+                scatter.destroy(); eigenvec.destroy()
 
                 # Optimal response
                 shell.ksp.solve(eigpre, resppre)
@@ -584,9 +689,11 @@ def run_slices(params):
                 scatter_r, respvec = PETSc.Scatter.toZero(resppre)
                 scatter_r.scatter(resppre, respvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
-                    mode2pval(respvecfile, respvec, nvars, n, neq, beta, dreduced, rgid)
+                    mode2pval(respvecfile, respvec, nvars, n, neq,
+                              beta, dreduced, rgid)
+                scatter_r.destroy(); respvec.destroy()
 
-                if compute_sensitivity:
+                if adjoint and compute_sensitivity:
                     mode_copy, _ = A_omega.getVecs()
                     eigpre.copy(mode_copy)
                     direct_modes.append(mode_copy)
@@ -599,13 +706,13 @@ def run_slices(params):
             eigv_file = os.path.join(output_path,
                 'eigv_DIR_{0}.dat'.format(omega))
             with open(eigv_file, 'w') as w:
-                for i in range(min(nconv, nev)):
+                for i in range(nsave):
                     w.write('{0:2d}   {1:12.8f}   {2:12.8f}\n'.format(
                         i, eigs[i].real, eigs[i].imag))
-            print(' Saved eigenvalues ->', eigv_file)
+            print(' Saved {0} eigenvalues -> {1}'.format(nsave, eigv_file))
 
-        # ── Adjoint problem (reuses LU) ───────────────────────────────────────
-        if compute_sensitivity and nconv > 0:
+        # ── Adjoint problem ───────────────────────────────────────────────────
+        if adjoint and nsave > 0:
 
             t0 = time.time()
             Print(' SOLVING ADJOINT PROBLEM (reusing LU)')
@@ -628,8 +735,10 @@ def run_slices(params):
             _t(comm, rank, '  Adjoint EPS solve', t0)
 
             nconv_adj = E_adj.getConverged()
+            nsave_adj = min(nconv_adj, nev)
             if rank == 0:
-                print(' Converged adjoint eigenvalues: ', nconv_adj)
+                print(' Adjoint converged: {0}  /  Saving: {1}'.format(
+                    nconv_adj, nsave_adj))
 
             xr_adj,     _ = shell.P.getVecs()
             xi_adj,     _ = shell.P.getVecs()
@@ -637,11 +746,10 @@ def run_slices(params):
             eigs_adj        = []
 
             t0 = time.time()
-            if nconv_adj > 0:
+            if nsave_adj > 0:
                 Print(" ADJOINT MODES:")
                 Print("           k*          ||Ax-kx||/||kx|| ")
                 Print("--------------------- ------------------")
-                nsave_adj = min(nconv_adj, nev)
                 for i in range(nsave_adj):
                     k_adj     = E_adj.getEigenpair(i, xr_adj, xi_adj)
                     error_adj = E_adj.computeError(i)
@@ -660,8 +768,9 @@ def run_slices(params):
                     if rank == 0:
                         mode2pval(adjvecfile, adjvec, nvars, n, neq,
                                   beta, dreduced, rgid)
+                    scatter_a.destroy(); adjvec.destroy()
 
-                    if i < len(direct_modes):
+                    if compute_sensitivity and i < len(direct_modes):
                         wmfile = os.path.join(output_path,
                             'sensitivity_{0}_{1}.pval'.format(i, omega))
                         compute_sensitivity_field(
@@ -675,20 +784,26 @@ def run_slices(params):
                 eigv_adj_file = os.path.join(output_path,
                     'eigv_ADJ_{0}.dat'.format(omega))
                 with open(eigv_adj_file, 'w') as w:
-                    for i in range(min(nconv_adj, nev)):
+                    for i in range(nsave_adj):
                         w.write('{0:2d}   {1:12.8f}   {2:12.8f}\n'.format(
                             i, eigs_adj[i].real, eigs_adj[i].imag))
-                print(' Saved adjoint eigenvalues ->', eigv_adj_file)
+                print(' Saved {0} adjoint eigenvalues -> {1}'.format(
+                    nsave_adj, eigv_adj_file))
 
             eigpre_adj.destroy(); xr_adj.destroy(); xi_adj.destroy()
             R_adj.destroy(); E_adj.destroy()
+            shell_adj.cleanup()
             _t(comm, rank, '  Adjoint mode save', t0)
 
         # ── Cleanup omega ─────────────────────────────────────────────────────
         for v in direct_modes:
             v.destroy()
+        direct_modes.clear()
+
+        shell.cleanup()
         R.destroy()
         A_omega.destroy()
+        gc.collect()
 
         _t(comm, rank, 'TOTAL omega={0}'.format(omega), t0_omega)
 
