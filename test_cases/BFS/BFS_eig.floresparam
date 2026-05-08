@@ -28,18 +28,27 @@ rlength = 1.0
 
 [solver]
 # Number of eigenvalues to request from SLEPc
-nev = 5
+nev = 1
+ncv = 20
 
 # Spectral shift  (real and imaginary parts stored separately)
-shift_real = -0.25
-shift_imag =  2
+shift_real = -0.05
+shift_imag =  0.7226
 
-# [eps]
-# method: sinvert (default) o feast
-# method         = sinvert
-# Solo para feast:
-# feast_radius   = 0.8
-# feast_ncontour = 8
+# False  -> only direct problem  A x = lambda x
+# True   -> direct + adjoint     A^H y = lambda* y
+adjoint = True
+ 
+# Compute structural sensitivity
+# Requires adjoint = True (enabled automatically if not set)
+sensitivity = True
+
+[domain_reduction]
+enabled = True
+xmin    =  -10.0
+xmax    =  30.0
+zmin    = -10.0
+zmax    =  10.0
 
 [checkpoint]
 # Tolerances for detecting duplicate eigenvalues across runs

@@ -27,12 +27,27 @@ omega_n     = 1
 [solver]
 # Number of eigenvalues (singular values) requested
 # Size of the Krylov subspace.
-ncv                 = 7
+ncv                 = 100
 # SLEPc will converge nev = 3*ncv
 nev               = 2
 # Spectral shift (real). Use 0 for no shift
 shift             = 0.0
-# Compute adjoint modes and structural sensitivity
-# True  -> solves both direct and adjoint problems
+
+# Compute adjoint modes (left singular vectors)
+# True  -> solves both direct and adjoint problems (doubles compute time)
 # False -> direct problem only
-compute_sensitivity = True
+adjoint = False
+
+# Compute structural sensitivity
+# Requires adjoint = True (enabled automatically if sensitivity = True)
+compute_sensitivity = False
+
+[domain_reduction]
+# Restrict the Jacobian and energy measure to a subdomain
+# coord_file must be present in input_path when enabled = True
+enabled = True
+xmin    = -15.0
+xmax    =  45.0
+zmin    =  -15.0
+zmax    =  15.0
+

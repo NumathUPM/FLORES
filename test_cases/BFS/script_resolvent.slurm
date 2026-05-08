@@ -47,5 +47,5 @@ echo " Node list    : ${SLURM_NODELIST}"
 echo " INI file     : ${INI_FILE}"
 echo "========================================"
 
-mpirun -n ${SLURM_NTASKS} python3 ${SOLVER_PATH}/resolvent.py ${INI_FILE}
+mpirun -n ${SLURM_NTASKS} python3 ${SOLVER_PATH}/resolvent_solver.py ${INI_FILE}
 
