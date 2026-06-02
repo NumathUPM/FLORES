@@ -1,841 +1,968 @@
-#! /usr/bin/env python
-#
-# Usage: python eig_simple.py eigensolver.ini
-#        mpirun -n 4 python eig_simple.py eigensolver.ini
-#
+#!/usr/bin/env python3
+"""
+plot_pval_mode.py
+-----------------
+Reads a .pval NetCDF file produced by mode2pval() and plots the
+eigenmode components on the 2D computational domain.
+
+Coordinate file (default: JAC/samg.matrix.coo)
+  Line 1  :  npoints_total   ndim
+  Lines 2+:  x   y   (one row per DOF, neq rows per mesh node -> identical coords)
+  -> unique grid nodes = npoints_total // neq
+
+File naming convention
+----------------------
+  eigf_i_omega.pval      optimal forcing   (direct)
+  eigr_i_omega.pval      optimal response
+  eiga_i_omega.pval      adjoint mode
+  sensitivity_i_omega.pval structural sensitivity (real field)
+
+Directory auto-detection
+------------------------
+  Directory name contains 'resolvent' -> resolvent mode:
+    plots eigf + eigr + eiga + sensitivity for each index
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+COORDINATES (one of these is required)
+  Default .coo file  : JAC/samg.matrix.coo  (use --jac to change directory)
+  TAU mesh NetCDF    : --mesh MESH/BFS_h4_2D.taumesh
+
+INPUT (one of these is required)
+  Single .pval file  : python plot_pval_mode.py path/to/eigf_0_1.2j.pval
+  Mode sweep         : --modes 0-9          (range)
+                       --modes 3            (single)
+                       --modes 0 2 5        (list)
+                       --modes 0-4 7        (mixed)
+                     + --dir RESULTS_eig/   (directory containing the files)
+
+WHAT TO PLOT
+  --vars u w         (default: rho u w e)
+  --fields eigf eigr (resolvent only; default: all four)
+  --imag             (imaginary part instead of real)
+  --both             (real + imaginary, 2 panels)
+
+DOMAIN WINDOW
+  --xlim -5 20       (default: full mesh extent)
+  --ylim 0 1         (default: full mesh extent)
+
+DIAGNOSTICS
+  --check-mesh       (plot mesh nodes, no .pval needed)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Sweep eigen-modes 0-20 using TAU mesh
+python plot_pval_mode.py --modes 0-20 --dir RESULTS_eig/ \\
+    --mesh MESH/BFS_h4_2D.taumesh
+
+# Resolvent results (auto-detected from directory name)
+python plot_pval_mode.py --modes 0-5 --dir RESULTS_resolvent/ \\
+    --mesh MESH/BFS_h4_2D.taumesh
+
+# Only forcing + response, restrict x window
+python plot_pval_mode.py --modes 0-5 --dir RESULTS_resolvent/ \\
+    --mesh MESH/BFS_h4_2D.taumesh --fields eigf eigr --xlim -2 15
+
+# Single file, both real and imaginary
+python plot_pval_mode.py RESULTS_eig/eigf_3_1.2j.pval \\
+    --mesh MESH/BFS_h4_2D.taumesh --both
+
+# Sanity-check mesh geometry
+python plot_pval_mode.py --check-mesh --mesh MESH/BFS_h4_2D.taumesh
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+import argparse
+from scipy.spatial import cKDTree
+import sys
+import os
+import glob
 import numpy as np
-import sys, os
-import time
-import configparser
-from scipy.sparse import csr_matrix, linalg as sla, identity
+import matplotlib
+matplotlib.use('Agg')   # non-interactive backend — fastest for file output
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from netCDF4 import Dataset
 
-from jac_red import domain_reduction
-from save2pval import mode2pval, mode2pval3D
-from input_output import openjacobian, read_coordinates
+# ── defaults ───────────────────────────────────────────────────────────────────
 
-import petsc4py
-import slepc4py
-slepc4py.init(sys.argv)
-from petsc4py import PETSc
-from slepc4py import SLEPc
-from mpi4py import MPI
+DEFAULT_JAC    = 'JAC'
+DEFAULT_COORDS = 'JAC/samg.matrix.coo'
+DEFAULT_MESH   = None
+XLIM           = None
+YLIM           = None
 
+# ── variable maps ──────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Timing helper
-# ─────────────────────────────────────────────────────────────────────────────
+VAR_MAP = {
+    'rho':   ('rho',   'rho_i'),
+    'u':     ('u',     'u_i'),
+    'w':     ('w',     'w_i'),
+    'e':     ('e',     'e_i'),
+    'v':     ('v',     None),
+    'turb1': ('turb1', 'turb1_i'),
+    'turb2': ('turb2', 'turb2_i'),
+}
 
-def _t(comm, rank, label, t0):
-    """Print elapsed time since t0 from rank 0, after a barrier sync."""
-    comm.Barrier()
-    if rank == 0:
-        PETSc.Sys.Print(' [TIMING] {0:<40s} {1:8.2f} s'.format(
-            label, time.time() - t0))
+LABELS = {
+    'rho':   r'$\hat{\rho}$',
+    'u':     r'$\hat{u}$',
+    'w':     r'$\hat{w}$',
+    'e':     r'$\hat{e}$',
+    'v':     r'$\hat{v}$',
+    'turb1': r'$\hat{\nu}_1$',
+    'turb2': r'$\hat{\nu}_2$',
+}
 
+ALL_PREFIXES = [
+    ('eigf',        'Forcing'),
+    ('eigr',        'Response'),
+    ('eiga',        'Adjoint'),
+    ('sensitivity', 'Sensitivity'),
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Control file reader
-# ─────────────────────────────────────────────────────────────────────────────
+SKIP_VARS_FOR = {
+    'eiga':        {'rho', 'e'},
+    'sensitivity': {'rho', 'e'},
+}
 
-def read_control_file(filepath):
+# ── coordinate loader (.coo) ───────────────────────────────────────────────────
+
+def load_coo(path, neq):
+    print(f"  Reading: {path}")
+    with open(path, 'r') as fh:
+        header        = fh.readline().split()
+        npoints_total = int(header[0])
+        ndim          = int(header[1])
+        gridpoints    = npoints_total // neq
+
+        print(f"    npoints_total = {npoints_total}   ndim = {ndim}   neq = {neq}")
+        print(f"    -> unique nodes = {gridpoints}")
+
+        if npoints_total % neq != 0:
+            print(f"  WARNING: {npoints_total} % {neq} = {npoints_total % neq} "
+                  "(not perfectly divisible; last partial node ignored)")
+
+        x = np.empty(gridpoints, dtype=np.float64)
+        y = np.empty(gridpoints, dtype=np.float64)
+
+        node = 0
+        for line_idx, line in enumerate(fh):
+            if line_idx % neq == 0:
+                vals    = line.split()
+                x[node] = float(vals[0])
+                y[node] = float(vals[1])
+                node   += 1
+                if node >= gridpoints:
+                    break
+
+    print(f"    Loaded {node} nodes   "
+          f"x∈[{x.min():.4g}, {x.max():.4g}]   "
+          f"y∈[{y.min():.4g}, {y.max():.4g}]")
+    return x, y
+
+# ── coordinate loader (TAU mesh) ───────────────────────────────────────────────
+
+def _extract_body_contour(quads, bmark_quads, x_all, z_all, n):
     """
-    Read parameters from a .ini control file.
+    Extract contour lines for boundary markers that represent physical walls
+    (not the 2D solver-plane faces).
 
-    Expected sections and keys:
+    Strategy: the solver-plane faces are the markers with ALL nodes < n.
+    All other markers are physical boundaries. For those, we project their
+    nodes onto the solver plane by taking their (xc, zc) coordinates directly
+    — the contour lives in the xz plane regardless of which copy of the node
+    is referenced.
 
-        [io]
-            input_path      : directory containing Jacobian / volume / coord files
-            output_path     : directory for eigenvalue and eigenvector output
-            jac_file        : Jacobian filename   (default: samg.matrix.amg.pval)
-            vol_file        : volumes filename    (default: samg.matrix.vol)
-            coord_file      : coordinates filename (default: samg.matrix.coo)
+    Returns a list of (N,2) arrays, one per physical boundary marker.
+    """
+    # Identify solver-plane markers (all nodes < n) — these are the domain faces
+    plane_markers = set()
+    for bm in np.unique(bmark_quads):
+        idx   = np.where(bmark_quads == bm)[0]
+        nodes = np.unique(quads[idx])
+        if (nodes < n).all():
+            plane_markers.add(bm)
 
-        [physics]
-            mach            : Mach number
-            beta            : spanwise wavenumber (0 for 2D)
-            rlength         : reference length (default: 1.0)
+    # Physical boundary markers = all others
+    body_markers = [bm for bm in np.unique(bmark_quads)
+                    if bm not in plane_markers]
 
-        [solver]
-            nev             : number of eigenvalues requested
-            shift_real      : real part of the spectral shift
-            shift_imag      : imaginary part of the spectral shift
-            tol             : EPS convergence tolerance  (default: 1e-8)
-            max_it          : EPS maximum iterations     (default: 15000)
-            adjoint         : solve adjoint problem?     (default: False)
-            gen             : generalised EVP (Ax=sMx)?  (default: False)
-            sensitivity     : compute structural sensitivity?
-                              requires adjoint=True (default: False)
+    if not body_markers:
+        return []
 
-        [domain_reduction]
-            enabled         : apply domain reduction?    (default: False)
-            xmin            : x lower bound
-            xmax            : x upper bound
-            zmin            : z lower bound
-            zmax            : z upper bound
+    contours    = []
+    seen_coords = set()   # deduplicate identical contours
+    for bm in body_markers:
+        idx   = np.where(bmark_quads == bm)[0]
+        faces = quads[idx]   # (n_faces, 4), indices into full x_all/z_all
 
-        [checkpoint]
-            dup_tol_real    : duplicate tolerance, real part  (default: 1e-5)
-            dup_tol_imag    : duplicate tolerance, imag part  (default: 1e-5)
+        # For each face, keep only edges where both nodes are on the same
+        # z-layer (either both < n or both >= n), then map to solver-plane coords
+        # using x_all[node], z_all[node].
+        edge_count = {}
+        for f in faces:
+            for i in range(4):
+                a, b = int(f[i]), int(f[(i+1) % 4])
+                # Only keep edges within the same z-layer
+                if (a < n) == (b < n):
+                    edge = (min(a,b), max(a,b))
+                    edge_count[edge] = edge_count.get(edge, 0) + 1
+
+        # Boundary edges appear once
+        boundary_edges = [e for e, c in edge_count.items() if c == 1]
+        if not boundary_edges:
+            boundary_edges = list(edge_count.keys())
+        if not boundary_edges:
+            continue
+
+        # Each boundary edge becomes an independent segment [pt_a, pt_b]
+        # using NaN separators so matplotlib draws them as disconnected lines
+        # in a single ax.plot() call — no walker needed, no spurious lines.
+        seg_x = []
+        seg_y = []
+        for a, b in boundary_edges:
+            seg_x += [x_all[a], x_all[b], np.nan]
+            seg_y += [z_all[a], z_all[b], np.nan]
+
+        if seg_x:
+            coords = np.column_stack((seg_x, seg_y))
+            # Deduplicate by edge count + bounding box
+            key = (len(boundary_edges), bm)
+            if key not in seen_coords:
+                seen_coords.add(key)
+                contours.append(coords)
+
+    return contours
+
+
+def _remap_triangulation(x_coo, y_coo, x_tau, y_tau, triang_tau):
+    """
+    Remap a TAU triangulation to the .coo node ordering.
+
+    Builds a KDTree on (x_tau, y_tau) and finds, for each .coo node,
+    the nearest TAU node.  Then remaps the triangle connectivity from
+    TAU indices to .coo indices.
+
+    Returns a new Triangulation in .coo node space, or None on failure.
+    """
+    print(f"  Remapping TAU triangulation to .coo node order …", flush=True)
+    tree = cKDTree(np.column_stack((x_tau, y_tau)))
+    dists, tau_to_coo = tree.query(np.column_stack((x_coo, y_coo)))
+
+    max_dist = dists.max()
+    print(f"    Max mapping distance: {max_dist:.2e}")
+    if max_dist > 1e-3:
+        print(f"    WARNING: large mapping distance — check mesh/coo compatibility")
+
+    # Build reverse map: tau_idx -> coo_idx
+    # tau_to_coo[i] = tau index nearest to coo node i
+    # We need coo index for each tau node in the triangles
+    n_tau = len(x_tau)
+    tau2coo = np.full(n_tau, -1, dtype=np.int64)
+    tau2coo[tau_to_coo] = np.arange(len(x_coo))
+
+    # Remap triangles
+    tris_tau = triang_tau.triangles          # (n_tri, 3) in TAU indices
+    tris_coo = tau2coo[tris_tau]             # remap to coo indices
+
+    # Drop triangles with unmapped nodes (-1)
+    valid = (tris_coo >= 0).all(axis=1)
+    tris_coo = tris_coo[valid]
+    print(f"    Triangles: {len(tris_tau)} → {len(tris_coo)} valid after remap")
+
+    return tri.Triangulation(x_coo, y_coo, tris_coo)
+
+
+def _detect_solver_marker(tris, quads, bmark_tris, bmark_quads, n):
+    """
+    Find the boundary marker whose faces cover exactly n unique nodes,
+    all with index < n.  This is the solver-plane marker.
+    """
+    candidates = {}
+    for bm in np.unique(np.concatenate([bmark_tris, bmark_quads])):
+        ti = np.where(bmark_tris  == bm)[0]
+        qi = np.where(bmark_quads == bm)[0]
+        nodes = []
+        if ti.size: nodes.append(tris[ti].ravel())
+        if qi.size: nodes.append(quads[qi].ravel())
+        all_nodes = np.unique(np.concatenate(nodes))
+        if (all_nodes < n).all():
+            candidates[bm] = len(all_nodes)
+
+    if not candidates:
+        raise ValueError("Could not auto-detect solver-plane marker. "
+                         "Use --face-marker N to specify it manually.")
+
+    # Pick the marker with the most nodes (= full solver plane)
+    best = max(candidates, key=candidates.get)
+    return best
+
+
+def load_taumesh(path, face_marker=None):
+    """
+    Read coordinates and 2D connectivity from a TAU NetCDF mesh file.
+
+    Coordinate mapping (confirmed empirically, Matlab view(0,0) = xz plane):
+      solver x = points_xc,  solver y = points_zc
+
+    Connectivity: boundary marker 2 contains both triangles (from prisms) and
+    quads (from hexas) covering exactly the solver-plane nodes.
+    Node indices are 1-based in the file → subtract 1 for 0-based Python.
 
     Returns
     -------
-    dict with all parameters.
+    x, y   : coordinate arrays (xc, zc), length = no_of_points // 2
+    triang : matplotlib.tri.Triangulation from surface connectivity
     """
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError('Control file not found: {0}'.format(filepath))
-
-    cfg = configparser.ConfigParser()
-    cfg.read(filepath)
-
-    p = {}
-
-    # [io]
-    p['input_path']  = cfg.get('io', 'input_path').strip()
-    p['output_path'] = cfg.get('io', 'output_path').strip()
-    p['jac_file']    = cfg.get('io', 'jac_file',   fallback='samg.matrix.amg.pval').strip()
-    p['vol_file']    = cfg.get('io', 'vol_file',   fallback='samg.matrix.vol').strip()
-    p['coord_file']  = cfg.get('io', 'coord_file', fallback='samg.matrix.coo').strip()
-
-    # [physics]
-    p['mach']    = cfg.getfloat('physics', 'mach')
-    p['beta']    = cfg.getfloat('physics', 'beta',    fallback=0.0)
-    p['rlength'] = cfg.getfloat('physics', 'rlength', fallback=1.0)
-
-    # [solver]
-    p['nev']     = cfg.getint('solver', 'nev')
-    p['ncv']     = cfg.getint('solver', 'ncv', fallback=0)  # 0 = auto (nev*3+1)
-    if cfg.has_option('solver', 'shift_real'):
-        sr         = cfg.getfloat('solver', 'shift_real')
-        si         = cfg.getfloat('solver', 'shift_imag', fallback=0.0)
-        p['shift'] = complex(sr, si)
-    elif cfg.has_option('solver', 'shift'):
-        p['shift'] = complex(cfg.get('solver', 'shift').strip())
-    else:
-        raise ValueError('El .ini debe definir shift_real/shift_imag o shift en [solver]')
-    p['tol']         = cfg.getfloat  ('solver', 'tol',         fallback=1e-8)
-    p['max_it']      = cfg.getint    ('solver', 'max_it',      fallback=15000)
-    p['adjoint']     = cfg.getboolean('solver', 'adjoint',     fallback=False)
-    p['gen']         = cfg.getboolean('solver', 'gen',         fallback=False)
-    p['sensitivity'] = cfg.getboolean('solver', 'sensitivity', fallback=False)
-
-    # [domain_reduction]
-    p['dreduced'] = cfg.getboolean('domain_reduction', 'enabled', fallback=False)
-    p['xmin']     = cfg.getfloat  ('domain_reduction', 'xmin',    fallback=0.0)
-    p['xmax']     = cfg.getfloat  ('domain_reduction', 'xmax',    fallback=1.0)
-    p['zmin']     = cfg.getfloat  ('domain_reduction', 'zmin',    fallback=-1.0)
-    p['zmax']     = cfg.getfloat  ('domain_reduction', 'zmax',    fallback=1.0)
-
-    # [checkpoint]
-    p['dup_tol_real'] = cfg.getfloat('checkpoint', 'dup_tol_real', fallback=1e-5)
-    p['dup_tol_imag'] = cfg.getfloat('checkpoint', 'dup_tol_imag', fallback=1e-5)
-
-    return p
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_previous_eigenvalues(eigv_file):
-    """Read eigenvalues already stored in eigv_file."""
-    eigs_prev = []
-    if not os.path.isfile(eigv_file):
-        return eigs_prev
-    with open(eigv_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            re = float(parts[1])
-            im = float(parts[2])
-            eigs_prev.append(complex(re, im))
-    return eigs_prev
-
-
-def is_duplicate(new_eig, existing_eigs, tol_real=1e-5, tol_imag=1e-5):
-    """Return True if new_eig already exists in existing_eigs within tolerance."""
-    for e in existing_eigs:
-        if abs(new_eig.real - e.real) < tol_real and \
-           abs(new_eig.imag - e.imag) < tol_imag:
-            return True
-    return False
-
-
-def next_eigvec_index(results_dir, prefix='eigf_'):
-    """Return the next available index for eigf_N.pval (or other prefix) files."""
-    max_idx = -1
-    if os.path.isdir(results_dir):
-        for fname in os.listdir(results_dir):
-            if fname.startswith(prefix) and fname.endswith('.pval'):
-                try:
-                    idx = int(fname[len(prefix):-len('.pval')])
-                    max_idx = max(max_idx, idx)
-                except ValueError:
-                    pass
-    return max_idx + 1
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Eigenproblem solver (direct or adjoint)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def solve_eigenproblem(A, B, nev, ncv, the_shift, tol, max_it, gen,
-                       two_sided, rank):
-    """
-    Set up and solve the eigenvalue problem A x = λ x using SLEPc/MUMPS
-    with shift-invert spectral transformation.
-
-    When two_sided=True, SLEPc also computes the left eigenvectors (adjoint
-    modes) in the same solve via E.setTwoSided(True).  The left eigenvector
-    y_i satisfies  y_i^H A = λ_i y_i^H, i.e. A^H y_i = conj(λ_i) y_i,
-    which is the adjoint problem — retrieved afterwards with
-    E.getLeftEigenvector(i, yr, yi).  No matrix transpose is needed.
-
-    Parameters
-    ----------
-    A          : PETSc.Mat — Jacobian (not modified)
-    B          : PETSc.Mat — mass matrix (used only when gen=True)
-    nev        : int       — number of eigenvalues requested
-    ncv        : int       — number of Krylov vectors (must be > nev)
-    the_shift  : complex
-    tol, max_it: float, int
-    gen        : bool      — generalised EVP?
-    two_sided  : bool      — also compute left eigenvectors (adjoint modes)?
-    rank       : int       — MPI rank
-
-    Returns
-    -------
-    E : SLEPc.EPS — solved EPS object (caller must destroy)
-    """
-    Print = PETSc.Sys.Print
-
-    mpd = ncv - 1
-
-    E = SLEPc.EPS().create()
-
-    if gen:
-        Print('  Generalised EGVP  Ax = s M x')
-        E.setOperators(A, B)
-    else:
-        Print('  Standard EGVP  Ax = s x')
-        E.setOperators(A)
-        E.setProblemType(SLEPc.EPS.ProblemType.NHEP)
-
-    # When two_sided=True SLEPc computes left eigenvectors (adjoint modes)
-    # in the same factorisation — no extra solve or matrix transpose needed.
-    if two_sided:
-        E.setTwoSided(True)
-
-    ST = E.getST()
-    ST.setType('sinvert')
-    ST.setShift(the_shift)
-    ST.setFromOptions()
-
-    K = ST.getKSP()
-    K.setType('preonly')
-    K.setFromOptions()
-    pc = K.getPC()
-    pc.setType('lu')
-    pc.setFactorSolverType('mumps')
-
-    E.setTolerances(tol=tol, max_it=max_it)
-    E.setDimensions(nev, ncv, mpd)
-    E.setWhichEigenpairs(E.Which.TARGET_MAGNITUDE)
-    E.setTarget(complex(the_shift))
-    E.setFromOptions()
-
-    if rank == 0:
-        print('')
-        print(' TYPE OF KSP:                    ', K.getType())
-        print(' ST Type                       = ', ST.getType())
-        print(' ST Shift                      = ', ST.getShift())
-        print(' Target                        = ', E.getTarget())
-        print(' EGV Solver                    = ', E.getType())
-        print(' EPS Problem Type              = ', E.getProblemType())
-        print(' Region of Spectrum            = ', E.getWhichEigenpairs())
-        print(' Number of eigenvalues requested = ', nev)
-        print(' Number of column vectors        = ', ncv)
-        print(' Maximum dimension (mpd)         = ', mpd)
-        print('')
-
-    E.solve()
-    return E
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Structural sensitivity
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
-                                   nvars, n, neq, beta, dreduced, rgid,
-                                   output_path, rank):
-    """
-    Compute and save the structural sensitivity for each mode pair.
-
-    Definition (Giannetti & Luchini 2007, Hill 1992):
-
-        S_i(x) = || q_adj_i(x) || * || q_dir_i(x) ||
-                 ─────────────────────────────────────
-                   | <q_adj_i, B q_dir_i> |
-
-    where  q_dir_i  is the i-th right eigenvector (direct mode)
-    and    q_adj_i  is the i-th left eigenvector  (adjoint mode),
-    both gathered to rank 0 as sequential arrays.
-
-    The denominator normalises by the biorthogonality inner product so that
-    the sensitivity amplitude is independent of the arbitrary scalings of the
-    two eigenvectors.
-
-    Parameters
-    ----------
-    dir_vecs  : list of PETSc.Vec  — direct modes in full space (size n)
-    adj_vecs  : list of PETSc.Vec  — adjoint modes in full space (size n)
-    B         : PETSc.Mat          — mass matrix
-    output_path : str
-    rank      : int
-    """
-    Print = PETSc.Sys.Print
-    Print('')
-    Print(' ── Computing structural sensitivity ──')
-
-    nmodes = min(len(dir_vecs), len(adj_vecs))
-
-    for i in range(nmodes):
-        q_dir = dir_vecs[i]
-        q_adj = adj_vecs[i]
-
-        # B * q_dir
-        Bq_dir, _ = B.getVecs()
-        B.mult(q_dir, Bq_dir)
-
-        # Gather to rank 0
-        sc_d, dir_seq  = PETSc.Scatter.toZero(q_dir)
-        sc_a, adj_seq  = PETSc.Scatter.toZero(q_adj)
-        sc_b, Bqd_seq  = PETSc.Scatter.toZero(Bq_dir)
-
-        sc_d.scatter(q_dir,  dir_seq,  False, PETSc.Scatter.Mode.FORWARD)
-        sc_a.scatter(q_adj,  adj_seq,  False, PETSc.Scatter.Mode.FORWARD)
-        sc_b.scatter(Bq_dir, Bqd_seq,  False, PETSc.Scatter.Mode.FORWARD)
-
-        if rank == 0:
-            dir_arr = dir_seq.getArray().copy()   # complex128, size n
-            adj_arr = adj_seq.getArray().copy()
-            Bqd_arr = Bqd_seq.getArray().copy()
-
-            # Biorthogonality inner product: <q_adj | B | q_dir>
-            inner_prod = np.dot(np.conj(adj_arr), Bqd_arr)
-            norm_ip    = abs(inner_prod)
-
-            if norm_ip < 1.0e-30:
-                Print(' WARNING: mode {0} — adjoint/direct inner product near'
-                      ' zero; sensitivity not normalised'.format(i))
-                norm_ip = 1.0
-
-            # Pointwise structural sensitivity
-            sensitivity = np.abs(adj_arr) * np.abs(dir_arr) / norm_ip
-
-            # Pack as complex array for mode2pval (imaginary part = 0)
-            sens_c = sensitivity.astype(np.complex128)
-
-            # Write to a temporary sequential PETSc Vec for mode2pval
-            sens_pvec = PETSc.Vec().createSeq(len(sens_c))
-            sens_pvec.setArray(sens_c)
-
-            outfile = os.path.join(output_path,
-                                   'sensitivity_{0}.pval'.format(i))
-            mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid)
-            if beta != 0:
-                mode2pval3D(outfile, sens_pvec, nvars, n, neq, beta, 21,
-                            dreduced, rgid)
-
-            Print(' Mode {0:3d}  |<q+,Bq>| = {1:.4e}   -> {2}'.format(
-                  i, norm_ip, outfile))
-            sens_pvec.destroy()
-
-        Bq_dir.destroy()
-
-    Print(' ── Structural sensitivity done ──')
-    Print('')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main solver
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_slices(params):
-    comm  = MPI.COMM_WORLD
-    rank  = comm.Get_rank()
-    nproc = comm.Get_size()
-    Print = PETSc.Sys.Print
-
-    t_total = time.time()
-
-    # ── Unpack parameters ────────────────────────────────────────────────────
-    input_path   = params['input_path']
-    output_path  = params['output_path']
-    mach         = params['mach']
-    beta         = params['beta']
-    rlength      = params['rlength']
-    nev          = params['nev']
-    _ncv_param   = params['ncv']
-    ncv          = _ncv_param if _ncv_param > 0 else nev * 3 + 1  # auto if 0
-    the_shift    = params['shift']
-    tol          = params['tol']
-    max_it       = params['max_it']
-    adjoint      = params['adjoint']
-    gen          = params['gen']
-    sensitivity  = params['sensitivity']
-    dreduced     = params['dreduced']
-    xmin         = params['xmin'];  xmax = params['xmax']
-    zmin         = params['zmin'];  zmax = params['zmax']
-    dup_tol_real = params['dup_tol_real']
-    dup_tol_imag = params['dup_tol_imag']
-
-    # Sensitivity requires both direct and adjoint modes
-    if sensitivity and not adjoint:
-        if rank == 0:
-            print(' WARNING: sensitivity=True requires adjoint=True.'
-                  ' Enabling adjoint automatically.')
-        adjoint = True
-
-    jacfile = os.path.join(input_path, params['jac_file'])
-    volfile = os.path.join(input_path, params['vol_file'])
-    coofile = os.path.join(input_path, params['coord_file'])
-
-    fac = 1. / (mach * np.sqrt(1.4))
-
-    # rank 0 creates the directory; barrier ensures all ranks wait
-    # until it exists before proceeding. makedirs handles nested paths
-    # and is a no-op if the directory already exists (exist_ok=True).
-    if rank == 0:
-        os.makedirs(output_path, exist_ok=True)
-    comm.Barrier()
-
-    # ── Print run summary ────────────────────────────────────────────────────
-    Print('')
-    Print(' ========================================')
-    Print('  EIGENSOLVER — FLORES')
-    Print(' ========================================')
-    Print(' Input path  : {0}'.format(input_path))
-    Print(' Output path : {0}'.format(output_path))
-    Print(' Jacobian    : {0}'.format(jacfile))
-    Print(' Mach        : {0}'.format(mach))
-    Print(' beta        : {0}'.format(beta))
-    Print(' Shift       : {0}'.format(the_shift))
-    Print(' nev         : {0}'.format(nev))
-    Print(' ncv         : {0}'.format(ncv))
-    Print(' Adjoint     : {0}'.format(adjoint))
-    Print(' Sensitivity : {0}'.format(sensitivity))
-    Print(' Generalised : {0}'.format(gen))
-    Print(' Dom. reduc. : {0}'.format(dreduced))
-    Print(' MPI ranks   : {0}'.format(nproc))
-    Print(' OMP threads : {0}'.format(os.environ.get('OMP_NUM_THREADS', '1')))
-    Print(' ========================================')
-    Print('')
-
-    # ── Checkpoint files ─────────────────────────────────────────────────────
-    eigv_dir_file = os.path.join(output_path, 'eigv_DIR.dat')
-    eigv_adj_file = os.path.join(output_path, 'eigv_ADJ.dat')
-
-    if rank == 0:
-        eigs_dir_prev = load_previous_eigenvalues(eigv_dir_file)
-        eigs_adj_prev = load_previous_eigenvalues(eigv_adj_file)
-        n_dir_prev    = len(eigs_dir_prev)
-        n_adj_prev    = len(eigs_adj_prev)
-        Print(' Found {0} previous direct eigenvalue(s)'.format(n_dir_prev))
-        Print(' Found {0} previous adjoint eigenvalue(s)'.format(n_adj_prev))
-    else:
-        eigs_dir_prev = eigs_adj_prev = None
-        n_dir_prev    = n_adj_prev    = None
-
-    eigs_dir_prev = comm.bcast(eigs_dir_prev, root=0)
-    eigs_adj_prev = comm.bcast(eigs_adj_prev, root=0)
-    n_dir_prev    = comm.bcast(n_dir_prev,    root=0)
-    n_adj_prev    = comm.bcast(n_adj_prev,    root=0)
-
-    dir_file_start = next_eigvec_index(output_path, prefix='eigf_')
-    adj_file_start = next_eigvec_index(output_path, prefix='eiga_')
-
-    # ── Read Jacobian ────────────────────────────────────────────────────────
-    t0 = time.time()
-    Print(' Reading Jacobian')
-    if rank == 0:
-        amatrix, neq = openjacobian(jacfile)
-        amatrix.data *= fac
-        nvars  = amatrix.shape[0]
-        nnz    = amatrix.nnz
-        meta   = np.array([neq, nvars, nnz], dtype=np.int64)
-    else:
-        meta = np.empty(3, dtype=np.int64)
-
-    comm.Bcast(meta, root=0)
-    neq, nvars, nnz = int(meta[0]), int(meta[1]), int(meta[2])
-
-    if rank == 0:
-        indptr_buf  = amatrix.indptr.astype(np.int32)
-        indices_buf = amatrix.indices.astype(np.int32)
-        data_buf    = amatrix.data.astype(np.complex128)
-    else:
-        indptr_buf  = np.empty(nvars + 1, dtype=np.int32)
-        indices_buf = np.empty(nnz,       dtype=np.int32)
-        data_buf    = np.empty(nnz,       dtype=np.complex128)
-
-    comm.Bcast(indptr_buf,  root=0)
-    comm.Bcast(indices_buf, root=0)
-    comm.Bcast(data_buf,    root=0)
-
-    amatrix = csr_matrix((data_buf, indices_buf, indptr_buf),
-                         shape=(nvars, nvars))
-
-    Print(' Matrix main dimension = {0}'.format(nvars))
-    Print(' Number of equations   = {0}'.format(neq))
-    Print('')
-    _t(comm, rank, 'Jacobian read', t0)
-
-    gridpoints = int(nvars / neq)
-
-    # ── Mass matrix ──────────────────────────────────────────────────────────
-    t0 = time.time()
-    Print(' Reading mass matrix and generating M')
-    Print('')
-    if rank == 0:
-        with open(volfile, 'r') as f:
-            vols_buf = np.array([float(line) for line in f.readlines()],
-                                dtype=np.float64)
-        ngp = np.array([len(vols_buf)], dtype=np.int64)
-    else:
-        ngp = np.empty(1, dtype=np.int64)
-
-    comm.Bcast(ngp, root=0)
-    if rank != 0:
-        vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
-    comm.Bcast(vols_buf, root=0)
-
-    bmatrix = identity(nvars, dtype='c16', format='csr')
-    bmatrix.data[:] = np.repeat(vols_buf, neq).astype(np.complex128)
-    _t(comm, rank, 'Mass matrix build', t0)
-
-    # ── Domain reduction — rank 0 only, then broadcast ──────────────────────
-    t0 = time.time()
-    if dreduced:
-        Print(' Applying domain reduction')
-        Print(' XMIN/XMAX = {0}/{1}'.format(xmin, xmax))
-        Print(' ZMIN/ZMAX = {0}/{1}'.format(zmin, zmax))
-
-        if rank == 0:
-            coord = read_coordinates(coofile, rlength, beta)
-            dr = domain_reduction(zmin, zmax, xmin, xmax)
-            dr.create_Pmatrix(coord)
-
-            nnz_before = amatrix.nnz
-            amatrix = dr.reduce_matrix(amatrix)
-            bmatrix = dr.reduce_matrix(bmatrix)
-            n_red   = amatrix.shape[0]
-            nnz_red = amatrix.nnz
-
-            localid = np.arange(0, gridpoints, 1, dtype='i4')
-            localid = np.repeat(localid, neq)
-            rgid    = dr.reduce_vector(localid)[0::neq].astype(int)
-
-            Print(' Previous NNZ = {0}'.format(nnz_before))
-            Print(' New NNZ      = {0}'.format(nnz_red))
-            Print(' New leading dimension of A = {0}'.format(n_red))
-            Print('')
-
-            # Pack reduced amatrix for broadcast
-            a_indptr  = amatrix.indptr.astype(np.int32)
-            a_indices = amatrix.indices.astype(np.int32)
-            a_data    = amatrix.data.astype(np.complex128)
-            b_data    = bmatrix.data.astype(np.complex128)  # diagonal only
-            meta_dr   = np.array([n_red, amatrix.nnz, len(rgid)], dtype=np.int64)
+    print(f"  Reading TAU mesh: {path}  (marker={face_marker})")
+    with Dataset(path, 'r') as ds:
+        n_total = len(ds.dimensions['no_of_points'])
+        x_all   = np.asarray(ds.variables['points_xc'][:], dtype=np.float64)
+        z_all   = np.asarray(ds.variables['points_zc'][:], dtype=np.float64)
+        bmark   = np.asarray(ds.variables['boundarymarker_of_surfaces'][:],
+                             dtype=np.int32)
+        # Surface triangles (optional — some meshes have none)
+        if 'no_of_surfacetriangles' in ds.dimensions and            len(ds.dimensions['no_of_surfacetriangles']) > 0:
+            n_stri = len(ds.dimensions['no_of_surfacetriangles'])
+            tris   = np.asarray(ds.variables['points_of_surfacetriangles'][:],
+                                dtype=np.int64)
         else:
-            meta_dr   = np.empty(3, dtype=np.int64)
-            a_indptr  = None
-            a_indices = None
-            a_data    = None
-            b_data    = None
-            rgid      = None
+            n_stri = 0
+            tris   = np.empty((0, 3), dtype=np.int64)
+        quads   = np.asarray(ds.variables['points_of_surfacequadrilaterals'][:],
+                             dtype=np.int64)
 
-        # Broadcast metadata
-        comm.Bcast(meta_dr, root=0)
-        n_red, nnz_red, ngrid_red = int(meta_dr[0]), int(meta_dr[1]), int(meta_dr[2])
+    n = n_total // 2
+    x = x_all[:n]
+    y = z_all[:n]
 
-        # Broadcast sparse arrays
-        if rank != 0:
-            a_indptr  = np.empty(n_red + 1,  dtype=np.int32)
-            a_indices = np.empty(nnz_red,     dtype=np.int32)
-            a_data    = np.empty(nnz_red,     dtype=np.complex128)
-            b_data    = np.empty(n_red,       dtype=np.complex128)
-            rgid      = np.empty(ngrid_red,   dtype=np.int64)
+    print(f"    no_of_points = {n_total}  →  using first {n} nodes")
+    print(f"    x∈[{x.min():.4g}, {x.max():.4g}]   y∈[{y.min():.4g}, {y.max():.4g}]")
 
-        comm.Bcast(a_indptr,  root=0)
-        comm.Bcast(a_indices, root=0)
-        comm.Bcast(a_data,    root=0)
-        comm.Bcast(b_data,    root=0)
-        comm.Bcast(rgid,      root=0)
+    # Split boundary marker array into triangle and quad parts
+    bmark_tris  = bmark[:n_stri]
+    bmark_quads = bmark[n_stri:]
 
-        # Reconstruct scipy matrices on all ranks
-        amatrix = csr_matrix((a_data, a_indices, a_indptr), shape=(n_red, n_red))
-        bmatrix = identity(n_red, dtype='c16', format='csr')
-        bmatrix.data[:] = b_data
+    # Auto-detect the solver-plane marker if not specified
+    if face_marker is None:
+        face_marker = _detect_solver_marker(
+            tris, quads, bmark_tris, bmark_quads, n)
+        print(f"    Auto-detected solver-plane marker: {face_marker}")
 
-        n    = n_red
-        rgid = rgid.astype(int)
+    # Select faces on the requested marker
+    tri_idx  = np.where(bmark_tris  == face_marker)[0]
+    quad_idx = np.where(bmark_quads == face_marker)[0]
+
+    if tri_idx.size == 0 and quad_idx.size == 0:
+        available = np.unique(bmark).tolist()
+        raise ValueError(
+            f"Boundary marker {face_marker} not found. "
+            f"Available markers: {available}."
+        )
+
+    face_tris  = tris[tri_idx]    # (n_tris_marker, 3)
+    face_quads = quads[quad_idx]  # (n_quads_marker, 4)
+    face_quads_solver = face_quads.copy() if len(face_quads) > 0 else None
+
+    print(f"    Marker {face_marker}: {len(tri_idx)} tris + {len(quad_idx)} quads")
+
+    # Split quads into 2 triangles each: [a,b,c,d] -> [a,b,c] and [a,c,d]
+    quad_tris = np.vstack([face_quads[:, [0, 1, 2]],
+                           face_quads[:, [0, 2, 3]]])
+
+    # Combine all triangles
+    parts = [a for a in [face_tris, quad_tris] if len(a) > 0]
+    all_tris = np.vstack(parts) if parts else np.empty((0,3), dtype=np.int64)
+
+    print(f"    Total elements: {len(all_tris)}", flush=True)
+    triang = tri.Triangulation(x, y, all_tris)
+
+    # Extract geometry contour: the boundary marker with fewest quads
+    # whose nodes are all in the solver plane (these are solid walls)
+    body_contour = _extract_body_contour(
+        quads, bmark_quads, x_all, z_all, n)
+    if body_contour:
+        for c in body_contour:
+            print(f"    Body contour: {len(c)} pts  "
+                  f"x∈[{c[:,0].min():.3g}, {c[:,0].max():.3g}]  "
+                  f"y∈[{c[:,1].min():.3g}, {c[:,1].max():.3g}]")
     else:
-        rgid = None
-        n    = nvars
-    _t(comm, rank, 'Domain reduction', t0)
+        print(f"    Body contour: NOT FOUND")
 
-    # ── Assemble PETSc matrices ──────────────────────────────────────────────
-    t0 = time.time()
-    A = PETSc.Mat()
-    A.create(PETSc.COMM_WORLD)
-    A.setSizes([n, n])
-    A.setFromOptions()
-    A.setUp()
+    return x, y, triang, body_contour, face_quads_solver
 
-    Print(' Assembling PETSc matrix A...')
-    rstart, rend  = A.getOwnershipRange()
-    indptr_local  = amatrix.indptr[rstart:rend + 1].copy()
-    indices_local = amatrix.indices[indptr_local[0]:indptr_local[-1]].copy()
-    values_local  = amatrix.data   [indptr_local[0]:indptr_local[-1]].copy()
-    indptr_local  = (indptr_local - indptr_local[0]).astype(PETSc.IntType)
-    indices_local = indices_local.astype(PETSc.IntType)
-    values_local  = values_local.astype(PETSc.ScalarType)
-    A.setValuesCSR(indptr_local, indices_local, values_local)
-    A.assemble()
-    _t(comm, rank, 'PETSc matrix A assembly', t0)
 
-    t0 = time.time()
-    B = PETSc.Mat()
-    B.create(PETSc.COMM_WORLD)
-    B.setSizes([n, n])
-    B.setFromOptions()
-    B.setUp()
-    rstart, rend = B.getOwnershipRange()
-    diag_vals    = bmatrix.data[rstart:rend].astype(PETSc.ScalarType)
-    diag_vec     = PETSc.Vec().createWithArray(diag_vals, comm=PETSc.COMM_WORLD)
-    B.setDiagonal(diag_vec)
-    B.assemble()
-    _t(comm, rank, 'PETSc matrix B assembly', t0)
+# ── pval reader ────────────────────────────────────────────────────────────────
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # DIRECT PROBLEM   A x = λ x
-    # ─────────────────────────────────────────────────────────────────────────
-    Print('\n################################')
-    if adjoint:
-        Print('    SOLVING DIRECT + ADJOINT PROBLEM')
-    else:
-        Print('    SOLVING DIRECT PROBLEM')
-    Print('################################\n')
+def read_pval(path, vars_to_plot):
+    data = {}
+    with Dataset(path, 'r') as ds:
+        nprob      = len(ds.dimensions['no_of_points'])
+        gridpoints = nprob // 2
+        avail      = set(ds.variables.keys())
 
-    t0 = time.time()
-    E_dir = solve_eigenproblem(A, B, nev, ncv, the_shift, tol, max_it,
-                               gen, two_sided=adjoint, rank=rank)
-    _t(comm, rank, 'EPS solve', t0)
+        print(f"  File         : {path}")
+        print(f"  no_of_points : {nprob}  ->  gridpoints = {gridpoints}")
+        print(f"  Variables    : {sorted(avail)}")
+        print()
 
-    its_dir   = E_dir.getIterationNumber()
-    nconv_dir = E_dir.getConverged()
-
-    if rank == 0:
-        print('')
-        print(' Iterations (EPS)        : ', its_dir)
-        print(' Converged               : ', nconv_dir)
-
-    xr, _ = A.getVecs()
-    xi, _ = A.getVecs()
-
-    new_dir_eigs  = []
-    dir_vecs_kept = []   # PETSc Vecs for sensitivity (only new modes)
-    skipped_dir   = 0
-    dir_file_idx  = dir_file_start
-
-    t0 = time.time()
-    if nconv_dir > 0:
-        Print("")
-        Print(" DIRECT MODES")
-        Print("           k           ||Ax-kx||/||kx||   status")
-        Print("----------------------------------------------------")
-
-        for i in range(nconv_dir):
-            k     = E_dir.getEigenpair(i, xr, xi)
-            error = E_dir.computeError(i)
-
-            already_known = is_duplicate(k, eigs_dir_prev,
-                                         tol_real=dup_tol_real,
-                                         tol_imag=dup_tol_imag)
-            status_str = "SKIP (duplicate)" if already_known else "NEW"
-
-            if k.imag != 0.0:
-                Print(" %9f%+9f j    %12g    %s" % (k.real, k.imag, error, status_str))
-            else:
-                Print(" %12f             %12g    %s" % (k.real, error, status_str))
-
-            if already_known:
-                skipped_dir += 1
+        for vname in vars_to_plot:
+            if vname not in VAR_MAP:
+                print(f"  [skip] Unknown variable '{vname}'. "
+                      f"Valid names: {list(VAR_MAP.keys())}")
+                continue
+            rname, iname = VAR_MAP[vname]
+            if rname not in avail:
+                print(f"  [skip] '{rname}' not found in file.")
                 continue
 
-            # Save eigenvector file
-            eigvecfile = os.path.join(output_path,
-                                      'eigf_{0}.pval'.format(dir_file_idx))
-            scatter, eigenvec = PETSc.Scatter.toZero(xr)
-            scatter.scatter(xr, eigenvec, False, PETSc.Scatter.Mode.FORWARD)
-            if rank == 0:
-                mode2pval(eigvecfile, eigenvec, nvars, n, neq, beta, dreduced, rgid)
-                if beta != 0:
-                    mode2pval3D(eigvecfile, eigenvec, nvars, n, neq, beta, 21,
-                                dreduced, rgid)
+            real_part = np.asarray(ds.variables[rname][:gridpoints], dtype=np.float64)
+            if iname and iname in avail:
+                imag_part = np.asarray(ds.variables[iname][:gridpoints], dtype=np.float64)
+            else:
+                imag_part = np.zeros_like(real_part)
 
-            # Keep a copy in memory for sensitivity computation
-            if sensitivity:
-                mode_copy, _ = A.getVecs()
-                xr.copy(mode_copy)
-                dir_vecs_kept.append(mode_copy)
+            nnan  = int(np.isnan(real_part).sum() + np.isnan(imag_part).sum())
+            nzero = int((np.abs(real_part) + np.abs(imag_part) == 0).sum())
+            print(f"  [{vname:6s}]  "
+                  f"|real|_max = {np.abs(real_part).max():.3e}   "
+                  f"|imag|_max = {np.abs(imag_part).max():.3e}   "
+                  f"NaNs = {nnan}   zeros = {nzero}/{gridpoints}")
 
-            new_dir_eigs.append(k)
-            dir_file_idx += 1
+            data[vname] = real_part + 1j * imag_part
 
-        Print("")
-    _t(comm, rank, 'Direct eigenvector save', t0)
+    return gridpoints, data
 
-    # Append direct eigenvalues to checkpoint file
-    if rank == 0:
-        n_new_dir = len(new_dir_eigs)
-        Print(' Direct summary: {0} converged | {1} skipped | {2} new'.format(
-              nconv_dir, skipped_dir, n_new_dir))
-        if n_new_dir > 0:
-            print(' Appending direct eigenvalues -> ', eigv_dir_file)
-            with open(eigv_dir_file, 'a') as w:
-                for j, eig in enumerate(new_dir_eigs):
-                    w.write('{0:2d}   {1:12.8f}   {2:12.8f}\n'.format(
-                        n_dir_prev + j, eig.real, eig.imag))
-            print(' DONE')
-        print('')
+# ── mesh check ─────────────────────────────────────────────────────────────────
 
-    # ── Adjoint modes are the left eigenvectors from the same solve ──────────
-    # (two_sided=adjoint was passed above; left vecs available via
-    #  E_dir.getLeftEigenvector when adjoint=True)
-    if adjoint:
-        nconv_adj = E_dir.getConverged()
+def check_mesh(x, y, triang=None, body_contour=None, mesh_quads=None, mesh_name='mesh'):
+    n = len(x)
+    print(f"\n── Mesh check ──────────────────────────────────────────────────")
+    print(f"  {n} nodes")
+    print(f"  x ∈ [{x.min():.6g}, {x.max():.6g}]")
+    print(f"  y ∈ [{y.min():.6g}, {y.max():.6g}]")
 
-        if rank == 0:
-            print('')
-            print(' Converged (adjoint modes) : ', nconv_adj)
+    fig, ax = plt.subplots(figsize=(14, 4), constrained_layout=True)
 
-        # Left eigenvectors retrieved from the same EPS object
-        yr, _ = A.getVecs()
-        yi, _ = A.getVecs()
+    if triang is not None:
+        ax.triplot(triang, color='k', linewidth=0.2, alpha=0.5,
+                   rasterized=True)
+        n_elem = len(triang.triangles)
+        ax.set_title(f'Mesh  —  {n} nodes  |  {n_elem} elements', fontsize=12)
+    else:
+        MAX_PTS = 300_000
+        xs, ys = (x, y) if n <= MAX_PTS else (
+            x[np.random.default_rng(0).choice(n, MAX_PTS, replace=False)],
+            y[np.random.default_rng(0).choice(n, MAX_PTS, replace=False)],
+        )
+        ax.scatter(xs, ys, c=ys, cmap='viridis', s=1,
+                   linewidths=0, rasterized=True)
+        ax.set_title(f'Mesh  —  {n} nodes', fontsize=12)
 
-        new_adj_eigs  = []
-        adj_vecs_kept = []   # PETSc Vecs for sensitivity
-        skipped_adj   = 0
-        adj_file_idx  = adj_file_start
+    for bc in (body_contour or []):
+        ax.plot(bc[:, 0], bc[:, 1], 'k-', linewidth=1.5)
 
-        t0 = time.time()
-        if nconv_adj > 0:
-            Print("")
-            Print(" ADJOINT MODES  (left eigenvectors: A^H y = conj(lambda) y)")
-            Print("           k*          ||A^H y - k* y||   status")
-            Print("----------------------------------------------------")
+    if XLIM:
+        ax.set_xlim(*XLIM)
+    if YLIM:
+        ax.set_ylim(*YLIM)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('x');  ax.set_ylabel('y')
+    out = f'{os.path.splitext(mesh_name)[0]}_check.png'
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {os.path.abspath(out)}')
+    plt.close(fig)
 
-            for i in range(nconv_adj):
-                # Right eigenvalue is λ; left eigenvector satisfies A^H y = λ* y
-                k = E_dir.getEigenpair(i, xr, xi)        # reuse xr/xi (right, not saved)
-                E_dir.getLeftEigenvector(i, yr, yi)       # adjoint mode
+# ── colour-map helpers ─────────────────────────────────────────────────────────
 
-                error = E_dir.computeError(i)
+def symmetric_norm(data, pct=90):
+    vmax = float(np.nanpercentile(np.abs(data), pct))
+    if vmax == 0:
+        vmax = float(np.nanmax(np.abs(data)))
+    if vmax == 0:
+        vmax = 1.0
+    return matplotlib.colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
 
-                # Eigenvalue for the adjoint mode is conj(k)
-                k_adj = k.conjugate()
 
-                already_known = is_duplicate(k_adj, eigs_adj_prev,
-                                             tol_real=dup_tol_real,
-                                             tol_imag=dup_tol_imag)
-                status_str = "SKIP (duplicate)" if already_known else "NEW"
+def positive_norm(data, pct=90):
+    vmax = float(np.nanpercentile(data, pct))
+    if vmax == 0:
+        vmax = float(np.nanmax(data))
+    if vmax == 0:
+        vmax = 1.0
+    # vmin: small positive value to avoid black background at zero
+    vmin = 0.0
+    return matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
 
-                if k_adj.imag != 0.0:
-                    Print(" %9f%+9f j    %12g    %s" % (
-                          k_adj.real, k_adj.imag, error, status_str))
+# ── colorbar helper ────────────────────────────────────────────────────────────
+
+def add_colorbar(ax, im):
+    divider    = make_axes_locatable(ax)
+    cax        = divider.append_axes('right', size='2%', pad=0.08)
+    cb         = ax.get_figure().colorbar(im, cax=cax, orientation='vertical')
+    cb.ax.tick_params(labelsize=8)
+    cb.formatter = matplotlib.ticker.ScalarFormatter(useMathText=True)
+    cb.formatter.set_powerlimits((-2, 2))   # scientific for |exp| > 2
+    cb.update_ticks()
+    return cb
+
+# ── triangulation ──────────────────────────────────────────────────────────────
+
+def build_triangulation(x, y):
+    print("  Building Delaunay triangulation …", end=' ', flush=True)
+    triang = tri.Triangulation(x, y)
+    mask   = tri.TriAnalyzer(triang).get_flat_tri_mask(min_circle_ratio=0.01)
+    triang.set_mask(mask)
+    print(f"{(~mask).sum()} valid triangles.")
+    return triang
+
+# ── single-mode plot ───────────────────────────────────────────────────────────
+
+def plot_modes(x, y, mode_data, cmap, output_stem, title_prefix,
+               triang=None, clim_pct=90, plot_imag=False, plot_both=False,
+               prefix=None, body_contour=None):
+    if not mode_data:
+        print("  Nothing to plot.")
+        return
+
+    if plot_both:
+        parts  = [('Real', lambda c: c.real), ('Imag', lambda c: c.imag)]
+        suffix = '_ri'
+    elif plot_imag:
+        parts  = [('Imag', lambda c: c.imag)]
+        suffix = '_i'
+    else:
+        parts  = [('Real', lambda c: c.real)]
+        suffix = ''
+
+    for vname, cdata in mode_data.items():
+        label    = LABELS.get(vname, vname)
+        n_panels = len(parts)
+
+        fig, axes = plt.subplots(
+            n_panels, 1,
+            figsize=(14, 3.2 * n_panels),
+            squeeze=False,
+        )
+        fig.subplots_adjust(hspace=0.4)
+
+        for ax, (part_label, extractor) in zip(axes[:, 0], parts):
+            arr = extractor(cdata)
+            # Compute norm using only nodes within the visible window
+            win_mask = ((x >= XLIM[0]) & (x <= XLIM[1]) &
+                        (y >= YLIM[0]) & (y <= YLIM[1]))
+            arr_win  = arr[win_mask] if win_mask.any() else arr
+            if prefix == 'sensitivity':
+                norm     = positive_norm(arr_win, pct=clim_pct)
+                cmap_use = 'Greys'
+            else:
+                norm     = symmetric_norm(arr_win, pct=clim_pct)
+                cmap_use = cmap
+            im = ax.tripcolor(triang, arr, cmap=cmap_use, norm=norm,
+                              shading='gouraud', rasterized=True)
+
+            for bc in (body_contour or []):
+                ax.plot(bc[:, 0], bc[:, 1], 'k-', linewidth=0.8, zorder=5)
+            ax.set_xlim(*XLIM)
+            ax.set_ylim(*YLIM)
+            ax.set_aspect('equal', adjustable='box')
+            add_colorbar(ax, im)
+            ax.set_title(f'{part_label}  {label}', fontsize=11, loc='left')
+            ax.set_xlabel('x', fontsize=9)
+            ax.set_ylabel('y', fontsize=9)
+            ax.tick_params(labelsize=8)
+
+        fig.suptitle(f'{title_prefix}  —  {label}', fontsize=13, fontweight='bold')
+        out = f'{output_stem}_{vname}{suffix}.png'
+        fig.savefig(out, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {out}")
+        plt.close(fig)
+
+# ── resolvent plot ─────────────────────────────────────────────────────────────
+
+def plot_resolvent(datasets, cmap, dir_path, idx_omega,
+                   triang, clim_pct=90, plot_imag=False, plot_both=False,
+                   body_contour=None):
+    if not datasets:
+        print("  Nothing to plot.")
+        return
+
+    if plot_both:
+        parts  = [("Real", lambda c: c.real), ("Imag", lambda c: c.imag)]
+        suffix = "_ri"
+    elif plot_imag:
+        parts  = [("Imag", lambda c: c.imag)]
+        suffix = "_i"
+    else:
+        parts  = [("Real", lambda c: c.real)]
+        suffix = ""
+
+    for prefix, field_label, ddict, is_sensitivity in datasets:
+        if not ddict:
+            continue
+        for vname, cdata in ddict.items():
+            label    = LABELS.get(vname, vname)
+            n_panels = len(parts)
+
+            fig, axes = plt.subplots(
+                n_panels, 1,
+                figsize=(14, 3.2 * n_panels),
+                squeeze=False,
+            )
+            fig.subplots_adjust(hspace=0.4)
+
+            for ax, (part_label, extractor) in zip(axes[:, 0], parts):
+                arr = extractor(cdata)
+                win_mask = ((x >= XLIM[0]) & (x <= XLIM[1]) &
+                            (y >= YLIM[0]) & (y <= YLIM[1]))
+                arr_win  = arr[win_mask] if win_mask.any() else arr
+                if prefix == 'sensitivity':
+                    norm     = positive_norm(arr_win, pct=clim_pct)
+                    cmap_use = 'Greys'
                 else:
-                    Print(" %12f             %12g    %s" % (
-                          k_adj.real, error, status_str))
+                    norm     = symmetric_norm(arr_win, pct=clim_pct)
+                    cmap_use = cmap
+                im = ax.tripcolor(triang, arr, cmap=cmap_use, norm=norm,
+                                  shading="gouraud", rasterized=True)
 
-                if already_known:
-                    skipped_adj += 1
-                    continue
+                for bc in (body_contour or []):
+                    ax.plot(bc[:, 0], bc[:, 1], 'k-', linewidth=0.8, zorder=5)
+                ax.set_xlim(*XLIM)
+                ax.set_ylim(*YLIM)
+                ax.set_aspect("equal", adjustable="box")
+                add_colorbar(ax, im)
+                ax.set_title(f"{field_label}  {part_label}  {label}",
+                             fontsize=11, loc="left")
+                ax.set_xlabel("x", fontsize=9)
+                ax.set_ylabel("y", fontsize=9)
+                ax.tick_params(labelsize=8)
 
-                # Save adjoint eigenvector file (prefix eiga_)
-                adjvecfile = os.path.join(output_path,
-                                          'eiga_{0}.pval'.format(adj_file_idx))
-                scatter_a, adjvec = PETSc.Scatter.toZero(yr)
-                scatter_a.scatter(yr, adjvec, False, PETSc.Scatter.Mode.FORWARD)
-                if rank == 0:
-                    mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid)
-                    if beta != 0:
-                        mode2pval3D(adjvecfile, adjvec, nvars, n, neq, beta, 21,
-                                    dreduced, rgid)
+            fig.suptitle(f"{field_label}  —  {label}", fontsize=13, fontweight="bold")
+            out = os.path.join(dir_path,
+                               f"{prefix}_{idx_omega}_{vname}{suffix}.png")
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+            print(f"  Saved: {out}")
+            plt.close(fig)
 
-                # Keep a copy for sensitivity
-                if sensitivity:
-                    adj_copy, _ = A.getVecs()
-                    yr.copy(adj_copy)
-                    adj_vecs_kept.append(adj_copy)
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-                new_adj_eigs.append(k_adj)
-                adj_file_idx += 1
-
-            Print("")
-        _t(comm, rank, 'Adjoint modes save', t0)
-
-
-        yr.destroy(); yi.destroy()
-
-        # Append adjoint eigenvalues
-        if rank == 0:
-            n_new_adj = len(new_adj_eigs)
-            Print(' Adjoint summary: {0} converged | {1} skipped | {2} new'.format(
-                  nconv_adj, skipped_adj, n_new_adj))
-            if n_new_adj > 0:
-                print(' Appending adjoint eigenvalues -> ', eigv_adj_file)
-                with open(eigv_adj_file, 'a') as w:
-                    for j, eig in enumerate(new_adj_eigs):
-                        w.write('{0:2d}   {1:12.8f}   {2:12.8f}\n'.format(
-                            n_adj_prev + j, eig.real, eig.imag))
-                print(' DONE')
-            print('')
-
-        # ── Structural sensitivity ────────────────────────────────────────────
-        if sensitivity and len(dir_vecs_kept) > 0 and len(adj_vecs_kept) > 0:
-            t0 = time.time()
-            compute_structural_sensitivity(
-                dir_vecs_kept, adj_vecs_kept, B,
-                nvars, n, neq, beta, dreduced, rgid,
-                output_path, rank)
-            _t(comm, rank, 'Structural sensitivity', t0)
-        elif sensitivity:
-            Print(' WARNING: no mode pairs available for sensitivity computation.')
-
-        # Clean up stored mode copies
-        for v in dir_vecs_kept + adj_vecs_kept:
-            v.destroy()
-
-    E_dir.destroy()
-    xr.destroy(); xi.destroy()
-
-    # ── Total ────────────────────────────────────────────────────────────────
-    _t(comm, rank, 'TOTAL', t_total)
+def vars_for_prefix(prefix, requested_vars):
+    skip = SKIP_VARS_FOR.get(prefix, set())
+    return [v for v in requested_vars if v not in skip]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def is_resolvent_dir(path):
+    return 'resolvent' in os.path.basename(os.path.abspath(path)).lower()
 
-if __name__ == "__main__":
 
-    if len(sys.argv) < 2:
-        print('Usage: python eig_simple.py <control_file.ini>')
-        print('       mpirun -n 4 python eig_simple.py <control_file.ini>')
-        sys.exit(1)
+def find_pval(directory, prefix, index):
+    matches = sorted(glob.glob(os.path.join(directory, f'{prefix}_{index}_*.pval')))
+    if not matches:
+        matches = sorted(glob.glob(os.path.join(directory, f'{prefix}_{index}.pval')))
+    return matches[0] if matches else None
 
-    ctrl_file = sys.argv[1]
-    params    = read_control_file(ctrl_file)
-    run_slices(params)
+
+def truncate(data_dict, common):
+    return {k: v[:common] for k, v in data_dict.items()}
+
+
+def parse_mode_indices(tokens):
+    indices = []
+    for token in tokens:
+        if '-' in token and not token.lstrip('-').isdigit():
+            start, end = token.split('-')
+            indices.extend(range(int(start), int(end) + 1))
+        else:
+            indices.append(int(token))
+    return sorted(set(indices))
+
+
+def tris_info(triang):
+    mask = triang.mask
+    n_valid = (~mask).sum() if mask is not None else len(triang.triangles)
+    return f"{n_valid} triangles from mesh connectivity"
+
+
+def print_usage_and_exit(error_msg=None):
+    """Print a concise usage guide and exit."""
+    if error_msg:
+        print(f"\n  ERROR: {error_msg}\n", file=sys.stderr)
+    print(__doc__)
+    sys.exit(1 if error_msg else 0)
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='Plot eigenmode .pval file on the 2D computational domain.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,   # we handle --help ourselves to show full usage
+        epilog=__doc__)
+
+    p.add_argument('pval', nargs='?', default=None,
+                   help='Path to a single .pval file '
+                        '(not required with --check-mesh or --modes)')
+
+    p.add_argument('--modes', nargs='+', metavar='N', default=None,
+                   help='Modes to plot: single (--modes 2), range (--modes 0-9), '
+                        'or list (--modes 0 2 5)')
+
+    p.add_argument('--dir', default='.',
+                   help='Directory containing pval files (default: .)')
+
+    p.add_argument('--jac', default='JAC',
+                   help='Path to the JAC directory containing samg.matrix.coo '
+                        '(default: JAC)')
+
+    p.add_argument('--mesh', default=None,
+                   help='TAU NetCDF mesh file. E.g. --mesh MESH/BFS_h4_2D.taumesh')
+
+    p.add_argument('--xlim', nargs=2, type=float, metavar=('XMIN', 'XMAX'),
+                   default=None,
+                   help='x-axis limits (default: full domain). E.g. --xlim -5 20')
+
+    p.add_argument('--ylim', nargs=2, type=float, metavar=('YMIN', 'YMAX'),
+                   default=None,
+                   help='y-axis limits (default: full domain). E.g. --ylim 0 1')
+
+    p.add_argument('--vars', nargs='+', default=['rho', 'u', 'w', 'e'],
+                   help=f'Variables to plot (default: rho u w e). '
+                        f'Available: {list(VAR_MAP.keys())}')
+
+    p.add_argument('--fields', nargs='+',
+                   choices=['eigf', 'eigr', 'eiga', 'sensitivity'],
+                   default=['eigf', 'eigr', 'eiga', 'sensitivity'],
+                   help='Resolvent fields to include (default: all).')
+
+    p.add_argument('--clim', type=float, default=90,
+                   help='Percentile for colorbar range [0-100] (default: 90). '
+                        'E.g. --clim 95')
+
+    p.add_argument('--imag', action='store_true',
+                   help='Plot imaginary part instead of real part')
+
+    p.add_argument('--both', action='store_true',
+                   help='Plot real and imaginary parts (2 panels per figure)')
+
+    p.add_argument('--check-mesh', action='store_true',
+                   help='Plot mesh nodes only (sanity check)')
+
+    p.add_argument('-h', '--help', action='store_true',
+                   help='Show this help and exit')
+
+    return p.parse_args()
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    global XLIM, YLIM
+    args = parse_args()
+
+
+    # Show help / usage when requested or when called with no arguments
+    if args.help or (not args.pval and not args.modes
+                     and not args.check_mesh):
+        print_usage_and_exit()
+
+    # ── 1. coordinates ─────────────────────────────────────────────────────────
+    print(f"\n── Loading coordinates ─────────────────────────────────────────")
+    mesh_triang  = None
+    body_contour = []
+    mesh_quads   = None
+
+    # Always load .coo for coordinates (correct node ordering for .pval)
+    coords_path = os.path.join(args.jac, 'samg.matrix.coo')
+    if not os.path.isfile(coords_path):
+        if args.mesh is None:
+            print_usage_and_exit(
+                f"coordinate file not found: '{coords_path}'\n"
+                f"  Use --jac <dir> to specify the JAC directory, or "
+                f"--mesh for a TAU mesh."
+            )
+    else:
+        x, y = load_coo(coords_path, neq=4)
+
+    # Load TAU mesh for triangulation and body contour (optional)
+    if args.mesh is not None:
+        if not os.path.isfile(args.mesh):
+            print_usage_and_exit(f"mesh file not found: '{args.mesh}'")
+        x_tau, y_tau, mesh_triang, body_contour, mesh_quads = load_taumesh(args.mesh)
+        if not os.path.isfile(coords_path):
+            # No .coo: use TAU coordinates directly
+            x, y = x_tau, y_tau
+        elif len(x) != len(x_tau) or not np.allclose(x[:5], x_tau[:5], atol=1e-6):
+            # .coo and TAU have different ordering — remap triangulation
+            mesh_triang = _remap_triangulation(x, y, x_tau, y_tau, mesh_triang)
+
+    # ── 2. set x limits ────────────────────────────────────────────────────────
+    if args.xlim is not None:
+        XLIM = tuple(args.xlim)
+        print(f"  x limits: {XLIM[0]} to {XLIM[1]}  (from --xlim)")
+    else:
+        XLIM = (float(x.min()), float(x.max()))
+        print(f"  x limits: {XLIM[0]:.4g} to {XLIM[1]:.4g}  (full domain)")
+
+    if args.ylim is not None:
+        YLIM = tuple(args.ylim)
+        print(f"  y limits: {YLIM[0]} to {YLIM[1]}  (from --ylim)")
+    else:
+        YLIM = (float(y.min()), float(y.max()))
+        print(f"  y limits: {YLIM[0]:.4g} to {YLIM[1]:.4g}  (full domain)")
+
+    # ── 3. mesh-only sanity check ──────────────────────────────────────────────
+    if args.check_mesh:
+        check_mesh(x, y,
+                   triang=mesh_triang,
+                   body_contour=body_contour,
+                   mesh_quads=mesh_quads,
+                   mesh_name=os.path.basename(args.mesh))
+        print("Done.\n")
+        return
+
+    # ── 4. detect resolvent directory ─────────────────────────────────────────
+    resolvent = is_resolvent_dir(args.dir)
+    if resolvent:
+        print(f"  Resolvent directory detected — plotting all available fields.")
+
+    # ── 5. build list of paths to process ─────────────────────────────────────
+    if args.modes is not None:
+        indices   = parse_mode_indices(args.modes)
+        work_list = []
+        for i in indices:
+            fp = find_pval(args.dir, 'eigf', i)
+            if fp is None:
+                for prefix, _ in ALL_PREFIXES:
+                    if prefix not in args.fields:
+                        continue
+                    fp = find_pval(args.dir, prefix, i)
+                    if fp is not None:
+                        break
+            if fp is None:
+                print(f"  [skip] No file found for index {i} in '{args.dir}'")
+            else:
+                work_list.append(fp)
+        if not work_list:
+            print_usage_and_exit(
+                f"no .pval files found for modes {args.modes} in '{args.dir}'"
+            )
+    elif args.pval is not None:
+        if not os.path.isfile(args.pval):
+            print_usage_and_exit(f".pval file not found: '{args.pval}'")
+        work_list = [args.pval]
+        resolvent = False
+    else:
+        print_usage_and_exit("provide a .pval file or use --modes.")
+
+    # ── 6. process ────────────────────────────────────────────────────────────
+    cached_triang  = None
+    cached_n_nodes = None
+
+    for item in work_list:
+
+        if not resolvent:
+            forc_path   = item
+            fname_base  = os.path.basename(forc_path)
+            file_prefix = next((p for p, _ in ALL_PREFIXES
+                                if fname_base.startswith(p + '_')), None)
+            vars_to_read = vars_for_prefix(file_prefix, args.vars) \
+                           if file_prefix else args.vars
+            print(f"\n── Reading file ────────────────────────────────────────────────")
+            gridpoints, forc_data = read_pval(forc_path, vars_to_read)
+            if not forc_data:
+                print(f"  [skip] No data in '{forc_path}'.")
+                continue
+            common = min(len(x), gridpoints)
+            xi, yi = x[:common], y[:common]
+            forc_data = truncate(forc_data, common)
+            if cached_n_nodes != common:
+                if mesh_triang is not None:
+                    # Trim triangulation to common nodes if needed
+                    if len(mesh_triang.x) != common:
+                        valid = (mesh_triang.triangles < common).all(axis=1)
+                        t_trim = mesh_triang.triangles[valid]
+                        plot_triang = tri.Triangulation(xi, yi, t_trim)
+                        print(f"  Using mesh connectivity ({(~plot_triang.mask).sum() if plot_triang.mask is not None else len(plot_triang.triangles)} triangles).")
+                    else:
+                        plot_triang = mesh_triang
+                        print(f"  Using mesh connectivity ({tris_info(mesh_triang)}).")
+                    cached_triang = plot_triang
+                else:
+                    cached_triang = build_triangulation(xi, yi)
+                cached_n_nodes = common
+            out_stem = os.path.splitext(os.path.abspath(forc_path))[0]
+            title    = os.path.basename(forc_path)
+            print(f"\n── Plotting ────────────────────────────────────────────────────")
+            plot_modes(xi, yi, forc_data, 'RdBu', out_stem, title,
+                       triang=cached_triang, clim_pct=args.clim,
+                       plot_imag=args.imag, plot_both=args.both,
+                       prefix=file_prefix, body_contour=body_contour)
+            continue
+
+        # ── resolvent mode ─────────────────────────────────────────────────────
+        ref_path   = item
+        ref_fname  = os.path.splitext(os.path.basename(ref_path))[0]
+        ref_prefix = next((p for p, _ in ALL_PREFIXES
+                           if ref_fname.startswith(p + '_')), None)
+        idx_omega  = ref_fname[len(ref_prefix) + 1:] if ref_prefix else ref_fname
+        idx = int(idx_omega.split('_')[0])
+
+        gridpoints, _ = read_pval(ref_path, ['u'])
+        common = min(len(x), gridpoints)
+        xi, yi = x[:common], y[:common]
+        if len(x) != gridpoints:
+            print(f"  WARNING: coord nodes ({len(x)}) ≠ gridpoints ({gridpoints}). "
+                  f"Truncating to {common}.")
+
+        if cached_n_nodes != common:
+            if mesh_triang is not None:
+                if len(mesh_triang.x) != common:
+                    valid = (mesh_triang.triangles < common).all(axis=1)
+                    t_trim = mesh_triang.triangles[valid]
+                    cached_triang = tri.Triangulation(xi, yi, t_trim)
+                else:
+                    cached_triang = mesh_triang
+                print(f"  Using mesh connectivity ({tris_info(cached_triang)}).")
+            else:
+                print(f"  Building Delaunay triangulation for {common} nodes …")
+                cached_triang = build_triangulation(xi, yi)
+            cached_n_nodes = common
+        else:
+            print(f"  Reusing cached triangulation ({common} nodes).")
+
+        datasets = []
+        for prefix, label in ALL_PREFIXES:
+            if prefix not in args.fields:
+                continue
+            path = find_pval(args.dir, prefix, idx)
+            if path is None:
+                print(f"  [{label}] not found for index {idx} — skipping.")
+                continue
+            print(f"\n── Reading {label} file ────────────────────────────────────────")
+            _, ddata = read_pval(path, vars_for_prefix(prefix, args.vars))
+            ddata = truncate(ddata, common)
+            datasets.append((prefix, label, ddata, prefix == 'sensitivity'))
+
+        if not datasets:
+            print(f"  [skip] No data loaded for index {idx}.")
+            continue
+
+        print(f"\n── Plotting ────────────────────────────────────────────────────")
+        plot_resolvent(datasets, 'RdBu',
+                       dir_path=os.path.abspath(args.dir),
+                       idx_omega=idx_omega,
+                       triang=cached_triang, clim_pct=args.clim,
+                       plot_imag=args.imag, plot_both=args.both,
+                       body_contour=body_contour)
+
+    print("Done.\n")
+
+
+if __name__ == '__main__':
+    main()
