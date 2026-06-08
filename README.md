@@ -13,11 +13,9 @@ Copyright (c) 2026 NUMATH https://numath.dmae.upm.es
 ## Table of Contents
 
 - [Background](#background)
-- [Mathematical Formulation](#mathematical-formulation)
 - [Repository Structure](#repository-structure)
 - [Dependencies & Installation](#dependencies--installation)
 - [Usage](#usage)
-- [Test Case: Backward-Facing Step](#test-case-backward-facing-step)
 - [Authors & Acknowledgements](#authors--acknowledgements)
 - [License](#license)
 
@@ -30,53 +28,18 @@ FLORES targets two classical problems in hydrodynamic stability theory:
 1. **Global eigenvalue analysis** — identifies the natural oscillatory modes of a flow (oscillator behaviour).
 2. **Resolvent analysis** — quantifies the linear amplification of external forcing by computing the leading singular values and modes of the resolvent operator (amplifier behaviour).
 
-Both analyses are performed on a linearised Navier–Stokes Jacobian produced by an external CFD solver.
+Both analyses are performed on a linearised Navier–Stokes Jacobian produced by CFD solver: DLR TAU Code.
 
 ---
 
-## Mathematical Formulation
-
-### Global Stability (eigenvalue problem)
-
-The linearised flow dynamics are governed by
-
-```
-dq'/dt = A q'
-```
-
-where `A` is the Jacobian of the nonlinear residual. The generalised eigenvalue problem
-
-```
-A x = λ B x
-```
-
-is solved with a shift-and-invert spectral transformation centred at a user-defined target `σ` in the complex plane. The mass matrix `B` contains the cell volumes. Direct and adjoint problems are both supported.
-
-### Resolvent Analysis
-
-For a temporal frequency `ω`, the resolvent operator is defined as
-
-```
-C(ω) = Pᵀ (iω B − A)⁻¹ P
-```
-
-where `P` is a prolongation matrix that restricts the input/output space to the momentum equations. The leading singular triplets of `C(ω)` are obtained by recasting the SVD as an eigenvalue problem
-
-```
-[C(ω) C(ω)†] f̂ = σ² f̂
-```
-
-which is solved with SLEPc. A single LU factorisation of `(iω B − A)` via MUMPS is reused for both the forward (`ksp.solve`) and adjoint (`ksp.solveTranspose`) solves, making the computation efficient for a sweep over multiple frequencies.
-
----
 
 ## Repository Structure
 
 ```
 FLORES/
     ├── solver/
-        ├── eig_simple.py            # Global stability solver (direct & adjoint)
-        ├── resolvent.py             # Resolvent operator solver (matrix-free shell)
+        ├── eig_solver.py            # Global stability solver (direct & adjoint & structural sensitivity)
+        ├── resolvent_solver.py      # Resolvent operator solver
         ├── jac_red.py               # Domain-reduction utilities
         ├── save2pval.py             # Output routines (eigenvector → .pval files)
         ├── input_output.py          # Jacobian and coordinate readers
@@ -84,6 +47,8 @@ FLORES/
     ├── JAC/                         # Input directory for jacobian matrices
     ├── RESULTS_eig/                 # Output directory for eigenvalue runs
     ├── RESULTS_resolvent/           # Output directory for resolvent runs
+    ├── test_cases/           # Test cases
+        ├── Cylinder_Re45          # Cylinder Re=45 and M=0.1
     └── README.md
 ```
 
@@ -132,45 +97,151 @@ A sanity check is run automatically at the end of each script, printing the PETS
 
 ## Usage
 
-### Global stability analysis (`eig.py`)
+Both solvers are configured through an `.ini` control file passed as a
+command-line argument, and can be run serially or in parallel via MPI.
 
-Edit the parameter block at the top of `eig.py`:
+### Global stability analysis (`solver/eig_solver.py`)
 
-```python
-jacfile   = 'JAC/samg.matrix.amg.pval'
-volfile   = 'JAC/samg.matrix.vol'
-nev       = 50          # number of eigenvalues requested
-the_shift = -0.05 + 4j  # shift in the complex plane
-adjoint   = False       # set True for adjoint problem
+Create a control file (e.g. `eigensolver.ini`):
+
+```ini
+[io]
+input_path   = JAC/
+output_path  = RESULTS_eig/
+jac_file     = samg.matrix.amg.pval
+vol_file     = samg.matrix.vol
+coord_file   = samg.matrix.coo
+
+[physics]
+mach    = 0.1
+beta    = 0.0
+rlength = 1.0
+
+[solver]
+nev          = 50           # number of eigenvalues requested
+ncv          = 0            # Krylov subspace size (0 = auto: nev*3+1)
+shift_real   = -0.05        # real part of spectral shift
+shift_imag   =  4.0         # imaginary part of spectral shift
+tol          = 1e-8         # SLEPc convergence tolerance
+max_it       = 15000        # maximum Krylov iterations
+adjoint      = False        # set True to also compute adjoint modes
+sensitivity  = False        # set True to compute structural sensitivity
+                            # (automatically enables adjoint = True)
+gen          = False        # generalised EVP (A x = s M x)?
+
+[domain_reduction]
+enabled = False             # set True to restrict to a subdomain
+xmin    = -2.0
+xmax    =  20.0
+zmin    = -5.0
+zmax    =  5.0
+
+[checkpoint]
+dup_tol_real = 1e-5         # duplicate-detection tolerance (real part)
+dup_tol_imag = 1e-5         # duplicate-detection tolerance (imag part)
 ```
 
-Submit via SLURM:
+Run:
 
 ```bash
-mpirun -np 8 python eig.py
+# Serial
+python solver/eig_solver.py eigensolver.ini
+
+# Parallel
+mpirun -np 8 python solver/eig_solver.py eigensolver.ini
 ```
 
-Converged eigenvalues are appended to `RESULTS_eig/eigv_DIR.dat` (or `eigv_ADJ.dat`). Eigenvectors are written as `RESULTS_eig/eigf_N.pval`. Duplicate detection across restarts is built in.
-
-### Resolvent analysis (`resolvent.py`)
-
-Edit the parameter block:
-
-```python
-jacfile    = 'JAC/samg.matrix.amg.pval'
-listomegas = [57.2j, 60j, 80j]   # list of frequencies ω to sweep
-nev        = 30                   # number of singular values requested
-```
-
-Submit via SLURM:
-
-```bash
-mpirun -np 8 python resolvent.py
-```
-
-Optimal forcing/response modes are written to `RESULTS_resolvent/` for each frequency.
+Converged direct eigenvalues are appended to `RESULTS_eig/eigv_DIR.dat`
+and eigenvectors written as `RESULTS_eig/eigf_N.pval`. When
+`adjoint = True`, adjoint eigenvalues go to `eigv_ADJ.dat` and adjoint
+modes to `eiga_N.pval`. When `sensitivity = True`, the structural
+sensitivity field for each mode pair is written to
+`RESULTS_eig/sensitivity_N.pval`. Duplicate detection across restarts
+is built in: previously converged eigenvalues are loaded on startup and
+skipped automatically.
 
 ---
+
+### Resolvent analysis (`solver/resolvent_solver.py`)
+
+Create a control file (e.g. `resolvent.ini`):
+
+```ini
+[io]
+input_path   = JAC/
+output_path  = RESULTS_resolvent/
+coord_file   = samg.matrix.coo
+
+[physics]
+mach    = 0.1
+beta    = 0.0
+rlength = 1.0
+
+[frequencies]
+omega_start = 10.0          # start of frequency sweep (imaginary part)
+omega_end   = 150.0         # end of frequency sweep
+omega_n     = 50            # number of frequencies
+
+[solver]
+nev                  = 5    # number of singular values requested
+ncv                  = 20   # Krylov subspace size
+shift                = 0.0  # spectral shift
+adjoint              = False # set True to also run adjoint resolvent
+compute_sensitivity  = False # set True to compute resolvent sensitivity
+                             # (automatically enables adjoint = True)
+
+[domain_reduction]
+enabled = False
+xmin    = -2.0
+xmax    =  20.0
+zmin    = -5.0
+zmax    =  5.0
+```
+
+Run:
+
+```bash
+# Serial
+python solver/resolvent_solver.py resolvent.ini
+
+# Parallel
+mpirun -np 8 python solver/resolvent_solver.py resolvent.ini
+```
+
+For each frequency `omega`, the optimal forcing modes are written to
+`RESULTS_resolvent/eigf_i_{omega}.pval`, the optimal response modes to
+`eigr_i_{omega}.pval`, and the gain values to `eigv_DIR_{omega}.dat`.
+When `adjoint = True`, adjoint modes are written to
+`eiga_i_{omega}.pval`. When `compute_sensitivity = True`, the
+resolvent structural sensitivity is written to
+`sensitivity_i_{omega}.pval`.
+
+---
+
+### Domain reduction
+
+Domain reduction can be enabled in either solver to restrict the
+eigenvalue or resolvent problem to a physically relevant subdomain
+$\Omega_m \subset \Omega_n$, reducing memory and factorisation cost by
+$10\times$–$50\times$. Set `enabled = True` in `[domain_reduction]`
+and specify the bounding box. The subdomain should contain the region
+of high structural sensitivity of the dominant mode.
+
+---
+
+### SLURM example
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=flores_eig
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+
+source myvenv/bin/activate
+mpirun -np 8 python solver/eig_solver.py eigensolver.ini
+```
 
 
 
