@@ -222,8 +222,7 @@ resolvent structural sensitivity is written to
 
 Domain reduction can be enabled in either solver to restrict the
 eigenvalue or resolvent problem to a physically relevant subdomain
-$\Omega_m \subset \Omega_n$, reducing memory and factorisation cost by
-$10\times$–$50\times$. Set `enabled = True` in `[domain_reduction]`
+$\Omega_m \subset \Omega_n$, reducing memory and computational cost. Set `enabled = True` in `[domain_reduction]`
 and specify the bounding box. The subdomain should contain the region
 of high structural sensitivity of the dominant mode.
 
