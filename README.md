@@ -1,4 +1,4 @@
-# FLORES: FLOw Linear analysis: Resolvent and Eigenvalue Solver
+# FLORES: FLOw linear analysis: Resolvent and Eigenvalue Solver
 
 MIT License
 
