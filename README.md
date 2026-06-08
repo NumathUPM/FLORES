@@ -1,4 +1,4 @@
-# FLORES: Flow Linear Operators: Resolvent and Eigenvalue Stability
+# FLORES: FLOw Linear analysis: Resolvent and Eigenvalue Solver
 
 MIT License
 
