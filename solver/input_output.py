@@ -4,7 +4,6 @@ from netCDF4 import Dataset
 import numpy as np
 from scipy.sparse import csr_matrix
 import sys,os
-import pdb
 
 ## ================================================================= ##
 
@@ -58,85 +57,60 @@ def openqe(jacfile):
 
 # -------------------------------------------------------------------- #
 
+def _interleave(fields, neq, dtype):
+    """Interleave per-point arrays [rho, u, w, e, (t1, t2)] into a flat
+    node-major vector of length gridpoints*neq."""
+    gridpoints = len(fields[0])
+    q = np.zeros(gridpoints*neq, dtype=dtype)
+    for k in range(neq):
+        q[k::neq] = fields[k]
+    return q
+
+# -------------------------------------------------------------------- #
+
 def openegvec(modefile, neq):
     """Opens a global mode from zTAUev and stores it into a 1D array."""
     mode = Dataset(modefile)
-    gridpoints = mode.dimensions['no_of_points'].size/2
-    n = gridpoints*neq
-    q = np.zeros(n, dtype='c16')
-    rho = mode.variables['rho'][:] + 1j*mode.variables['rho_i'][:]
-    u   = mode.variables['u'][:]   + 1j*mode.variables['u_i'][:]
-    w   = mode.variables['w'][:]   + 1j*mode.variables['w_i'][:]
-    e   = mode.variables['e'][:]   + 1j*mode.variables['e_i'][:]
-    if neq>4:
-        t1  = mode.variables['turb1'][:] + 1j*mode.variables['turb1_i'][:]
-        t2  = mode.variables['turb2'][:] + 1j*mode.variables['turb2_i'][:]
-    gid = mode.variables['global_id'][:]
-    for i in range(0, n, neq):
-        q[i]   = rho[i/neq]
-        q[i+1] = u[i/neq]
-        q[i+2] = w[i/neq]
-        q[i+3] = e[i/neq]
-        if neq>4:
-            q[i+4] = t1[i/neq]
-            q[i+5] = t2[i/neq]
+    gridpoints = mode.dimensions['no_of_points'].size // 2
+    v = mode.variables
+    fields = [v[name][:gridpoints] + 1j*v[name+'_i'][:gridpoints]
+              for name in ('rho', 'u', 'w', 'e')]
+    if neq > 4:
+        fields += [v[name][:gridpoints] + 1j*v[name+'_i'][:gridpoints]
+                   for name in ('turb1', 'turb2')]
+    gid = v['global_id'][:]
     mode.close()
-    return q, gid
+    return _interleave(fields, neq, 'c16'), gid
 
 # -------------------------------------------------------------------- #
 
 def openresidual(resfile, neq):
     """Opens a residuals file from TAU and stores it into a 1D array."""
     mode = Dataset(resfile)
-    gridpoints = mode.dimensions['no_of_points'].size/2
-    n = gridpoints*neq
-    q = np.zeros(n, dtype='f8')
-    rho = mode.variables['density_residual'][:]
-    u   = mode.variables['x-velocity_residual'][:]
-    w   = mode.variables['z-velocity_residual'][:]
-    e   = mode.variables['energy_residual'][:]
-    if neq>4:
-        t1  = mode.variables['k_residual'][:]
-        t2  = mode.variables['omega_residual'][:]
-
-    for i in range(0, n, neq):
-        q[i]   = rho[i/neq]
-        q[i+1] = u[i/neq]
-        q[i+2] = w[i/neq]
-        q[i+3] = e[i/neq]
-        if neq>4:
-            q[i+4] = t1[i/neq]
-            q[i+5] = t2[i/neq]
+    gridpoints = mode.dimensions['no_of_points'].size // 2
+    v = mode.variables
+    names = ['density_residual', 'x-velocity_residual',
+             'z-velocity_residual', 'energy_residual']
+    if neq > 4:
+        names += ['k_residual', 'omega_residual']
+    fields = [v[name][:gridpoints] for name in names]
     mode.close()
-    return q
+    return _interleave(fields, neq, 'f8')
 
 # -------------------------------------------------------------------- #
 
 def openbflow(resfile, neq):
-    """Opens a residuals file from TAU and stores it into a 1D array."""
+    """Opens a base-flow solution file from TAU and stores it into a 1D array."""
     mode = Dataset(resfile)
-    gridpoints = mode.dimensions['no_of_points'].size/2
-    n = gridpoints*neq
-    q = np.zeros(n, dtype='f8')
-    rho = mode.variables['density'][:]
-    u   = mode.variables['x_velocity'][:]
-    w   = mode.variables['z_velocity'][:]
-    e   = mode.variables['pressure'][:]
-    gid = mode.variables['global_id'][:]
-    if neq>4:
-        t1  = mode.variables['turb_kinetic_energy'][:]
-        t2  = mode.variables['turb_omega'][:]
-
-    for i in range(0, n, neq):
-        q[i]   = rho[i/neq]
-        q[i+1] = u[i/neq]
-        q[i+2] = w[i/neq]
-        q[i+3] = e[i/neq]
-        if neq>4:
-            q[i+4] = t1[i/neq]
-            q[i+5] = t2[i/neq]
+    gridpoints = mode.dimensions['no_of_points'].size // 2
+    v = mode.variables
+    names = ['density', 'x_velocity', 'z_velocity', 'pressure']
+    if neq > 4:
+        names += ['turb_kinetic_energy', 'turb_omega']
+    fields = [v[name][:gridpoints] for name in names]
+    gid = v['global_id'][:]
     mode.close()
-    return q, gid
+    return _interleave(fields, neq, 'f8'), gid
 
 # -------------------------------------------------------------------- #
 
@@ -188,26 +162,14 @@ def read_coordinates(coordfile, rlength, beta):
 def opensensitivity(sensfile, neq):
     """Opens a sensitivity file and stores it into a 1D array."""
     mode = Dataset(sensfile)
-    gridpoints = mode.dimensions['no_of_points'].size/2
-    n = gridpoints*neq
-    sens = np.zeros(n, dtype='c16')
-    rho = mode.variables['rho'][:] + 1j*mode.variables['rho_i'][:]
-    u   = mode.variables['u'][:]   + 1j*mode.variables['u_i'][:]
-    w   = mode.variables['w'][:]   + 1j*mode.variables['w_i'][:]
-    e   = mode.variables['e'][:]   + 1j*mode.variables['e_i'][:]
-    if neq>4:
-        t1  = mode.variables['t1'][:] + 1j*mode.variables['t1_i'][:]
-        t2  = mode.variables['t2'][:] + 1j*mode.variables['t2_i'][:]
-
-    for i in range(0, n, neq):
-        sens[i]   = rho[i/neq]
-        sens[i+1] = u[i/neq]
-        sens[i+2] = w[i/neq]
-        sens[i+3] = e[i/neq]
-        if neq>4:
-            sens[i+4] = t1[i/neq]
-            sens[i+5] = t2[i/neq]
+    gridpoints = mode.dimensions['no_of_points'].size // 2
+    v = mode.variables
+    fields = [v[name][:gridpoints] + 1j*v[name+'_i'][:gridpoints]
+              for name in ('rho', 'u', 'w', 'e')]
+    if neq > 4:
+        fields += [v[name][:gridpoints] + 1j*v[name+'_i'][:gridpoints]
+                   for name in ('t1', 't2')]
     mode.close()
-    return sens
+    return _interleave(fields, neq, 'c16')
 
 # -------------------------------------------------------------------- #
