@@ -54,6 +54,9 @@ def read_control_file(filepath):
             mach            : Mach number
             beta            : spanwise wavenumber (0 for 2D)
             rlength         : reference length (default: 1.0)
+            output_slices   : number of spanwise slices in the 3-D
+                              reconstructed output *3D.pval, only used
+                              if beta != 0 (default: 21)
 
         [solver]
             nev             : number of eigenvalues requested
@@ -100,6 +103,7 @@ def read_control_file(filepath):
     p['mach']    = cfg.getfloat('physics', 'mach')
     p['beta']    = cfg.getfloat('physics', 'beta',    fallback=0.0)
     p['rlength'] = cfg.getfloat('physics', 'rlength', fallback=1.0)
+    p['output_slices'] = cfg.getint('physics', 'output_slices', fallback=21)
 
     # [solver]
     p['nev']     = cfg.getint('solver', 'nev')
@@ -269,7 +273,7 @@ def solve_eigenproblem(A, B, nev, ncv, the_shift, tol, max_it, gen,
 
 def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
                                    nvars, n, neq, beta, dreduced, rgid,
-                                   output_path, rank):
+                                   output_path, rank, output_slices=21):
     """
     Compute and save the structural sensitivity for each mode pair.
 
@@ -346,7 +350,7 @@ def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
                                    'sensitivity_{0}.pval'.format(i))
             mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid)
             if beta != 0:
-                mode2pval3D(outfile, sens_pvec, nvars, n, neq, beta, 21,
+                mode2pval3D(outfile, sens_pvec, nvars, n, neq, beta, output_slices,
                             dreduced, rgid)
 
             Print(' Mode {0:3d}  |<q+,Bq>| = {1:.4e}   -> {2}'.format(
@@ -377,6 +381,7 @@ def run_slices(params):
     mach         = params['mach']
     beta         = params['beta']
     rlength      = params['rlength']
+    output_slices = params['output_slices']
     nev          = params['nev']
     _ncv_param   = params['ncv']
     ncv          = _ncv_param if _ncv_param > 0 else nev * 3 + 1  # auto if 0
@@ -682,7 +687,7 @@ def run_slices(params):
             if rank == 0:
                 mode2pval(eigvecfile, eigenvec, nvars, n, neq, beta, dreduced, rgid)
                 if beta != 0:
-                    mode2pval3D(eigvecfile, eigenvec, nvars, n, neq, beta, 21,
+                    mode2pval3D(eigvecfile, eigenvec, nvars, n, neq, beta, output_slices,
                                 dreduced, rgid)
 
             # Keep a copy in memory for sensitivity computation
@@ -771,7 +776,7 @@ def run_slices(params):
                 if rank == 0:
                     mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid)
                     if beta != 0:
-                        mode2pval3D(adjvecfile, adjvec, nvars, n, neq, beta, 21,
+                        mode2pval3D(adjvecfile, adjvec, nvars, n, neq, beta, output_slices,
                                     dreduced, rgid)
 
                 # Keep a copy for sensitivity
@@ -809,7 +814,7 @@ def run_slices(params):
             compute_structural_sensitivity(
                 dir_vecs_kept, adj_vecs_kept, B,
                 nvars, n, neq, beta, dreduced, rgid,
-                output_path, rank)
+                output_path, rank, output_slices)
             _t(comm, rank, 'Structural sensitivity', t0)
         elif sensitivity:
             Print(' WARNING: no mode pairs available for sensitivity computation.')
