@@ -15,6 +15,8 @@ mach   = 0.1
 beta   = 0
 # Number of spanwise slices (only used if beta != 0)
 nslices = 7
+# Spanwise distance between consecutive slices (only used if beta != 0)
+slice_spacing = 1.0
 
 [frequencies]
 # Frequency sweep: omega values are purely imaginary (i*omega)

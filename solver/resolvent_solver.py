@@ -51,6 +51,9 @@ def read_control_file(filepath):
             mach                : Mach number
             beta                : spanwise wavenumber (0 for 2D)
             nslices             : number of slices (only used if beta != 0)
+            slice_spacing       : spanwise distance between consecutive
+                                  slices, dy (only used if beta != 0,
+                                  default: 1.0)
             rlength             : reference length (default: 1.0)
 
         [frequencies]
@@ -89,6 +92,7 @@ def read_control_file(filepath):
     params['mach']    = cfg.getfloat('physics', 'mach')
     params['beta']    = cfg.getfloat('physics', 'beta',    fallback=0.0)
     params['nslices'] = cfg.getint  ('physics', 'nslices', fallback=7)
+    params['slice_spacing'] = cfg.getfloat('physics', 'slice_spacing', fallback=1.0)
     params['rlength'] = cfg.getfloat('physics', 'rlength', fallback=1.0)
 
     # [frequencies]
@@ -380,6 +384,7 @@ def run_slices(params):
     mach                = params['mach']
     beta                = params['beta']
     nslices             = params['nslices']
+    slice_spacing       = params['slice_spacing']
     rlength             = params['rlength']
     listomegas          = params['listomegas']
     nev                 = params['nev']
@@ -439,13 +444,19 @@ def run_slices(params):
         else:
             nvars //= nslices
             Print(' J0 block main dimension = {0}'.format(nvars))
-            Ly = 1
-            Print(' Extracting and compacting Jacobian')
-            midrow  = mjac[nvars*3:nvars*4, :].tocsc()
-            jm1     = midrow[:, nvars*2:nvars*3]
-            j0      = midrow[:, nvars*3:nvars*4]
-            j1      = midrow[:, nvars*4:nvars*5]
-            amatrix = j0 + j1*np.exp(1j*beta*Ly) - j1*np.exp(-1j*beta*Ly)
+            # Central slice c couples to its neighbours c-1 and c+1.
+            # With q_{c+-1} = q_c exp(+-i beta dy), the row block of slice c
+            # collapses to  J_{c,c-1} e^{-i beta dy} + J_{c,c} + J_{c,c+1} e^{+i beta dy}
+            dy = slice_spacing
+            c  = nslices // 2
+            Print(' Extracting and compacting Jacobian (central slice {0},'
+                  ' dy = {1})'.format(c, dy))
+            midrow  = mjac[nvars*c:nvars*(c+1), :].tocsc()
+            jm1     = midrow[:, nvars*(c-1):nvars*c]
+            j0      = midrow[:, nvars*c:nvars*(c+1)]
+            j1      = midrow[:, nvars*(c+1):nvars*(c+2)]
+            amatrix = (j0 + j1*np.exp(1j*beta*dy)
+                          + jm1*np.exp(-1j*beta*dy))
             amatrix = amatrix.tocsr()
             del midrow, jm1, j0, j1
 
