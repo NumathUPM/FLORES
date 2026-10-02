@@ -135,6 +135,33 @@ $1/(M_\infty\sqrt{\gamma})$, with $\gamma = 1.4$ hard-coded.
 > with the second spatial coordinate called **z**. `neq` is read from the
 > Jacobian file.
 
+**Jacobian volume scaling (TAU option).** The Jacobian exported by TAU may or
+may not be divided by the cell volumes. This is controlled by the TAU
+parameter file option
+
+```
+Jacobian volume scaling (0/1): 1
+```
+
+| TAU option | Exported matrix $\mathbf{A}_\mathrm{TAU}$ | Physical problem |
+|---|---|---|
+| `1` | $\mathbf{M}^{-1}\mathbf{J}$ (already divided by volume) | $\mathbf{A}_\mathrm{TAU}\hat{oldsymbol{q}} = \sigma\hat{oldsymbol{q}}$, i.e. the standard EVP (7) with $\mathbf{L}=\mathbf{A}_\mathrm{TAU}$ |
+| `0` | $\mathbf{J}$ (not divided) | $\mathbf{A}_\mathrm{TAU}\hat{oldsymbol{q}} = \sigma\mathbf{M}\hat{oldsymbol{q}}$, i.e. the generalised EVP (6) |
+
+FLORES does **not** read this option from TAU, and the `.pval` Jacobian file
+does not record it. The user must choose the solver settings to match how the
+Jacobian was generated:
+
+| TAU `Jacobian volume scaling` | `eig_solver.py` | `resolvent_solver.py` |
+|---|---|---|
+| `1` | `gen = False` ✅ (default) | ✅ consistent as implemented ($L = i\omega\mathbf{I} - \mathbf{A}$, RHS $\mathbf{P}f$) |
+| `0` | `gen = True` ✅ | ❌ not supported: it would need $L = i\omega\mathbf{M} - \mathbf{A}$ and RHS $\mathbf{M}\mathbf{P}f$ |
+
+Mixing them, e.g. a Jacobian generated with `0` solved with `gen = False`, or
+`1` with `gen = True`, gives eigenvalues and modes that are wrong by a
+non-uniform (cell-volume dependent) scaling and **does not raise any error**.
+See [§11](#11-known-discrepancies-and-open-issues), item 3.
+
 **Turbulent and mean-flow analyses.** When the base flow comes from a RANS
 simulation, the linearisation is performed around the steady turbulent
 solution, which satisfies $\mathcal{R}(\bar{\boldsymbol{q}}) = \boldsymbol{0}$
@@ -183,12 +210,14 @@ The right eigenvector $\hat{\boldsymbol{q}}$ is the *direct global mode*.
 > `eig_solver.py` has a `gen` flag (default `False`):
 >
 > - `gen = False` (default) solves the **standard** problem
->   $\mathbf{A}\hat{\boldsymbol{q}} = \sigma\hat{\boldsymbol{q}}$.
->   The mass matrix is **not** used, and neither (6) nor (7) is solved.
->   This is only equivalent to (6)/(7) if the TAU Jacobian is already divided
->   by the cell volumes, i.e. if TAU exports $\mathbf{M}^{-1}\partial\mathcal{R}/\partial\boldsymbol{q}$.
->   **This must be confirmed.**
-> - `gen = True` solves the generalised problem (6) with $\mathbf{B} = \mathbf{M}$ (cell volumes).
+>   $\mathbf{A}\hat{\boldsymbol{q}} = \sigma\hat{\boldsymbol{q}}$ without the
+>   mass matrix. This is correct for Jacobians generated with TAU
+>   `Jacobian volume scaling = 1` ($\mathbf{A} = \mathbf{M}^{-1}\mathbf{J}$, problem (7)).
+> - `gen = True` solves the generalised problem (6) with $\mathbf{B} = \mathbf{M}$
+>   (cell volumes). This is correct for Jacobians generated with
+>   `Jacobian volume scaling = 0`.
+>
+> The choice is left to the user (see the table in [§1.2.1](#121-linearised-compressible-navierstokes)).
 
 ##### Adjoint problem
 
@@ -412,9 +441,13 @@ factorisation of $L(\omega)$ computed at the start of each frequency.
 > 2. The forcing on the right-hand side is $\mathbf{P}\hat{\boldsymbol{f}}$,
 >    not $\mathbf{M}\mathbf{P}\hat{\boldsymbol{f}}$.
 >
-> Both are consistent with (15) only if the TAU Jacobian is already
-> $\mathbf{M}^{-1}\partial\mathcal{R}/\partial\boldsymbol{q}$, the same
-> assumption as for the eigenvalue solver. **This must be confirmed.**
+> With TAU `Jacobian volume scaling = 1` ($\mathbf{A} = \mathbf{M}^{-1}\mathbf{J}$),
+> multiplying (15) by $\mathbf{M}^{-1}$ gives
+> $(i\omega\mathbf{I} - \mathbf{A})\hat{\boldsymbol{q}} = \mathbf{P}\hat{\boldsymbol{f}}$,
+> which is exactly what the code solves. With `Jacobian volume scaling = 0`
+> the resolvent is **wrong**, because the solver has no `gen`-type option. Use
+> Jacobians generated with `1`, or scale the rows of $\mathbf{A}$ by
+> $\mathbf{M}^{-1}$ before building $L$.
 >
 > SLEPc treats $\mathbf{D}$ as a non-Hermitian problem (`NHEP`). The weight
 > $\mathbf{P}^T\mathbf{M}^{-1}$ makes $\mathbf{D}$ self-adjoint only in the
@@ -847,7 +880,8 @@ shift_imag   = 10.0
 tol          = 1e-8        # default
 max_it       = 15000       # default
 adjoint      = True        # default False
-gen          = False       # default False: standard EVP A x = σ x
+gen          = False       # default False: standard EVP A x = σ x  (TAU Jacobian volume scaling = 1)
+                           # True: A x = σ M x                      (TAU Jacobian volume scaling = 0)
 sensitivity  = True        # default False; forces adjoint = True
 
 [domain_reduction]
@@ -949,14 +983,24 @@ $$
 They are retrieved with `E.getLeftEigenvector(i, yr, yi)` and written to
 `eiga_N.pval`. The value written to `eigv_ADJ.dat` is $\sigma_k^*$.
 
-Relation to the adjoint in the $\mathbf{M}$ inner product: if
-$\mathbf{A}\boldsymbol{q} = \sigma\mathbf{M}\boldsymbol{q}$
-(`gen = True`), the left eigenvector $\boldsymbol{p}$ is exactly the
-$\mathbf{M}$-adjoint mode, $\hat{\boldsymbol{q}}^+ = \boldsymbol{p}$
-(from $\mathbf{L}^+\hat{\boldsymbol{q}}^+ = \mathbf{M}^{-1}\mathbf{A}^H\hat{\boldsymbol{q}}^+$).
-If `gen = False` and the Jacobian is not already divided by the volumes, the
-mode in the $\mathbf{M}$ norm would be $\mathbf{M}^{-1}\boldsymbol{p}$. **The
-code does not apply this transformation.**
+Relation to the adjoint in the $\mathbf{M}$ inner product (8), for the two
+consistent configurations:
+
+- **TAU scaling `0` + `gen = True`** ($\mathbf{A}=\mathbf{J}$,
+  $\mathbf{J}\boldsymbol{q} = \sigma\mathbf{M}\boldsymbol{q}$). The left
+  eigenvector *is* the $\mathbf{M}$-adjoint mode:
+  $\mathbf{M}^{-1}\mathbf{J}^H\boldsymbol{p} = \sigma^*\boldsymbol{p}$, so
+  $\hat{\boldsymbol{q}}^+ = \boldsymbol{p}$. Bi-orthogonality:
+  $\boldsymbol{p}^H\mathbf{M}\hat{\boldsymbol{q}}$.
+- **TAU scaling `1` + `gen = False`** ($\mathbf{A}=\mathbf{M}^{-1}\mathbf{J}$,
+  $\mathbf{L}=\mathbf{A}$). The $\mathbf{M}$-adjoint is
+  $\mathbf{L}^+ = \mathbf{M}^{-1}\mathbf{A}^H\mathbf{M}$, and its eigenvector
+  is $\hat{\boldsymbol{q}}^+ = \mathbf{M}^{-1}\boldsymbol{p}$. Bi-orthogonality:
+  $\boldsymbol{p}^H\hat{\boldsymbol{q}} = \langle\hat{\boldsymbol{q}}^+,\hat{\boldsymbol{q}}\rangle_\mathbf{M}$.
+  **The code writes $\boldsymbol{p}$ to `eiga_N.pval` without applying
+  $\mathbf{M}^{-1}$.** The spatial distribution therefore differs from the
+  $\mathbf{M}$-adjoint by a factor $1/V_\mathrm{cell}$, which matters on
+  stretched meshes.
 
 ### 6.5 Structural sensitivity
 
@@ -986,13 +1030,16 @@ that variable. It can be plotted with `tools/plot_pval_eigfunction.py`.
 > 1. (21) is not the Frobenius norm of the tensor (13). For that, compute
 >    per node $\|\hat{\boldsymbol{q}}^+(\boldsymbol{x})\|\,\|\hat{\boldsymbol{q}}(\boldsymbol{x})\|$
 >    (usually velocity components only).
-> 2. The normalisation uses $\boldsymbol{p}^H\mathbf{B}\hat{\boldsymbol{q}}$.
->    With `gen = False`, the left eigenvectors are bi-orthogonal under
->    $\boldsymbol{p}^H\hat{\boldsymbol{q}}$, so the consistent combination is
->    either $\boldsymbol{p}^H\hat{\boldsymbol{q}}$, or
->    $\hat{\boldsymbol{q}}^+ = \mathbf{M}^{-1}\boldsymbol{p}$ with
->    $\langle\hat{\boldsymbol{q}}^+,\mathbf{M}\hat{\boldsymbol{q}}\rangle$
->    (numerically the same).
+> 2. The normalisation always uses $\boldsymbol{p}^H\mathbf{B}\hat{\boldsymbol{q}}$
+>    (with $\mathbf{B}=\mathbf{M}$).
+>    - **TAU scaling `0` + `gen = True`:** correct.
+>    - **TAU scaling `1` + `gen = False`:** the consistent normalisation is
+>      $\boldsymbol{p}^H\hat{\boldsymbol{q}}$, and the numerator should use
+>      $\hat{\boldsymbol{q}}^+ = \mathbf{M}^{-1}\boldsymbol{p}$.
+>
+>    Because both errors are a constant factor in the denominator, the
+>    *shape* of the field is affected only by the $\mathbf{M}^{-1}$ in the
+>    numerator. The absolute value is affected by both.
 > 3. Direct and adjoint modes are paired by their position in the lists of
 >    *new* modes. Because duplicates are filtered separately for the direct
 >    (`eigv_DIR.dat`) and adjoint (`eigv_ADJ.dat`) lists, the pairs can end up
@@ -1329,10 +1376,10 @@ Review of branch `miguel_dev` (commit `64c5503`). Ordered by impact.
 |---|---|---|---|
 | 1 | `resolvent_solver.py` (`beta ≠ 0`) | `j0 + j1·e^{iβ} − j1·e^{−iβ}`: `jm1` is never used, the sign is wrong, `Ly = 1` is hard-coded. | `j0 + j1·e^{iβLy} + jm1·e^{−iβLy}`, with `Ly` as a parameter. |
 | 2 | `resolvent_solver.py` | Shell size `n//2`; only correct for `neq = 4`. | `2*n//neq`. |
-| 3 | `resolvent_solver.py` | $L = i\omega\mathbf{I}-\mathbf{A}$ and RHS $\mathbf{P}f$ (no $\mathbf{M}$). | Confirm whether the TAU Jacobian is already divided by the volume; otherwise use $i\omega\mathbf{M}-\mathbf{A}$ and RHS $\mathbf{M}\mathbf{P}f$. |
-| 4 | `eig_solver.py` | `gen = False` by default ⇒ $\mathbf{A}x=\sigma x$ without $\mathbf{M}$. | Same as #3; document or change the default. |
+| 3 | both solvers | Whether the Jacobian is divided by the volume depends on TAU's `Jacobian volume scaling (0/1)`, which FLORES cannot detect. The resolvent only supports `1`; the eigensolver relies on the user setting `gen` to match. Mismatches fail silently. | Add a `[physics] jacobian_volume_scaling = 0/1` key. If `0`, scale the rows of $\mathbf{A}$ by $\mathbf{M}^{-1}$ on read, so both solvers always work with $\mathbf{M}^{-1}\mathbf{J}$ and `gen` is no longer needed. |
+| 4 | `eig_solver.py` | Adjoint modes written as $\boldsymbol{p}$; with scaling `1` + `gen = False` the $\mathbf{M}$-adjoint is $\mathbf{M}^{-1}\boldsymbol{p}$. | Apply $\mathbf{M}^{-1}$ before writing `eiga_N.pval` (and before the sensitivity). |
 | 5 | `eig_solver.py` | Sensitivity per DOF, not per node (Frobenius norm). | Compute per node $\|q^+\|\|q\|$ (velocity) and write one scalar field. |
-| 6 | `eig_solver.py` | Normalisation $p^H\mathbf{B}q$ is correct only for `gen = True`; with `gen = False` the left eigenvectors are bi-orthogonal under $p^Hq$. | Use $p^Hq$ when `gen = False` (or $\mathbf{M}^{-1}p$ with $\mathbf{M}$). |
+| 6 | `eig_solver.py` | Normalisation $p^H\mathbf{B}q$ is correct only for scaling `0` + `gen = True`; with scaling `1` + `gen = False` it should be $p^Hq$. | Becomes automatic with the fix for #3 + #4 ($\hat q^+=\mathbf{M}^{-1}p$, $\langle\hat q^+,\mathbf{M}\hat q\rangle$). |
 | 7 | `eig_solver.py` | Direct/adjoint pairing after separate duplicate filtering. | Pair by EPS index before filtering. |
 | 8 | `resolvent_solver.py` | "Adjoint" operator $\mathbf{P}^T\mathbf{M}^{-1}L^{-1}\mathbf{Q}L^{-H}\mathbf{P}$ is not $\mathbf{R}\mathbf{R}^\dagger$. | Check that its eigenvalues match; redefine if needed. |
 | 9 | `resolvent_solver.py` | Energy norm $\mathbf{Q}=\mathbf{M}$ (not Chu). | Implement Chu (requires the base flow) or document it. |
