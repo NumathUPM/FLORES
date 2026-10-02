@@ -53,88 +53,51 @@ def sens2pval(filename, gid, sens, npoints, neq, dreduced=False, rgid=None):
     """
     Write a sensitivity field to a TAU-compatible netCDF .pval file.
 
-    Note: the 'v' (spanwise) component is zero for 2-D cases (beta=0).
+    Variables written (both halves of 'no_of_points'):
+        rho, u, w, e (+ '_i' imaginary parts), v (zero for 2-D),
+        sens_R = |Re(u, w)|, sens_Im = |Im(u, w)|, [turb1, turb2 (+ '_i')]
+
+    Parameters
+    ----------
+    gid      : TAU global_id array (length 2*gridpoints)
+    sens     : complex sensitivity vector (length nred, interleaved by neq)
+    npoints  : unused, kept for backward compatibility
+    dreduced : True if sens lives on a reduced domain
+    rgid     : grid-point indices of the reduced domain (dreduced=True)
+
+    Returns
+    -------
+    sens_R + 1j*sens_Im  (on the reduced/original sens grid)
     """
-    senspoints = npoints // neq
-    nprob      = len(gid)
-    gridpoints = nprob // 2
+    gridpoints = len(gid) // 2
 
-    # Unpack — vectorised strided slicing, no loops
-    rho = sens[0::neq].copy()
-    u   = sens[1::neq].copy()
-    w   = sens[2::neq].copy()
-    e   = sens[3::neq].copy()
-    v   = np.zeros(senspoints, dtype='c16')   # spanwise: zero for 2-D
+    fields = {k: np.array(val) for k, val in _unpack_sol(sens, neq).items()}
+    fields['v'] = np.zeros_like(fields['u'])     # spanwise: zero for 2-D
 
-    if neq >= 5:
-        t1 = sens[4::neq].copy()
-    if neq >= 6:
-        t2 = sens[5::neq].copy()
+    sens_R  = np.sqrt(fields['u'].real**2 + fields['w'].real**2)
+    sens_Im = np.sqrt(fields['u'].imag**2 + fields['w'].imag**2)
 
-    sens_R  = np.sqrt(u.real**2 + w.real**2)
-    sens_Im = np.sqrt(u.imag**2 + w.imag**2)
+    def _full(arr):
+        """Scatter a reduced-domain array onto the full grid."""
+        if not dreduced:
+            return arr
+        out = np.zeros(gridpoints, dtype=arr.dtype)
+        out[rgid] = arr
+        return out
 
     amg_f = Dataset(filename, 'w')
-    amg_f.createDimension('no_of_points', nprob)
-
-    _write_var(amg_f, 'global_id_f8',  # global_id kept as int below
-               np.zeros(gridpoints))   # placeholder — overwritten
+    amg_f.createDimension('no_of_points', len(gid))
     amg_f.createVariable('global_id', 'i', ('no_of_points',))
     amg_f.variables['global_id'][:] = gid
 
-    if dreduced:
-        # Scatter reduced values into full arrays, then mirror
-        def _scatter(arr_r, arr_i=None):
-            full_r = np.zeros(gridpoints)
-            full_r[rgid] = arr_r
-            if arr_i is not None:
-                full_i = np.zeros(gridpoints)
-                full_i[rgid] = arr_i
-                return full_r, full_i
-            return full_r
-
-        _write_var(amg_f, 'rho',    *_scatter(rho.real, rho.imag))
-        _write_var(amg_f, 'rho_i',  np.zeros(gridpoints), _scatter(rho.imag))  # mirror
-        # rebuild cleanly
-        for vname, arr in [('rho', rho), ('u', u), ('w', w), ('e', e),
-                           ('v', v)]:
-            fr = np.zeros(gridpoints); fr[rgid] = arr.real
-            fi = np.zeros(gridpoints); fi[rgid] = arr.imag
-            _write_var(amg_f, vname,       fr)
-            if vname != 'v':
-                _write_var(amg_f, vname+'_i', fi)
-
-        sr_full = np.zeros(gridpoints); sr_full[rgid] = sens_R
-        si_full = np.zeros(gridpoints); si_full[rgid] = sens_Im
-        _write_var(amg_f, 'sens_R',  sr_full)
-        _write_var(amg_f, 'sens_Im', si_full)
-
-        if neq >= 5:
-            ft1r = np.zeros(gridpoints); ft1r[rgid] = t1.real
-            ft1i = np.zeros(gridpoints); ft1i[rgid] = t1.imag
-            _write_var(amg_f, 'turb1',   ft1r)
-            _write_var(amg_f, 'turb1_i', ft1i)
-        if neq >= 6:
-            ft2r = np.zeros(gridpoints); ft2r[rgid] = t2.real
-            ft2i = np.zeros(gridpoints); ft2i[rgid] = t2.imag
-            _write_var(amg_f, 'turb2',   ft2r)
-            _write_var(amg_f, 'turb2_i', ft2i)
-    else:
-        for vname, arr in [('rho', rho), ('u', u), ('w', w), ('e', e),
-                           ('v', v)]:
-            _write_var(amg_f, vname, arr.real)
-            if vname != 'v':
-                _write_var(amg_f, vname+'_i', arr.imag)
-
-        _write_var(amg_f, 'sens_R',  sens_R)
-        _write_var(amg_f, 'sens_Im', sens_Im)
-
-        if neq >= 5:
-            _write_var(amg_f, 'turb1',   t1.real)
-            _write_var(amg_f, 'turb1_i', t1.imag)
-        if neq >= 6:
-            _write_var(amg_f, 'turb2',   t2.real)
-            _write_var(amg_f, 'turb2_i', t2.imag)
+    for vname in ['rho', 'u', 'w', 'e', 'turb1', 'turb2']:
+        if vname in fields:
+            arr = _full(fields[vname])
+            _write_var(amg_f, vname,        arr.real)
+            _write_var(amg_f, vname + '_i', arr.imag)
+    _write_var(amg_f, 'v',       _full(fields['v']).real)
+    _write_var(amg_f, 'sens_R',  _full(sens_R))
+    _write_var(amg_f, 'sens_Im', _full(sens_Im))
 
     amg_f.close()
     return np.array(sens_R + 1j * sens_Im)
@@ -148,7 +111,7 @@ def sol2pval(filename, gid, sol, npoints, neq, dreduced=False, rgid=None):
     """Write a real base-flow solution to a TAU .pval file."""
     gridpoints = npoints // neq
 
-    # Vectorised unpacking — replaces the Python xrange loop
+    # Vectorised unpacking
     rho = np.asarray(sol[0::neq], dtype=np.float64)
     u   = np.asarray(sol[1::neq], dtype=np.float64)
     w   = np.asarray(sol[2::neq], dtype=np.float64)
@@ -262,23 +225,22 @@ def mode2pval3D(filename, sol, npoints, nred, neq, beta, nums,
     gridpoints_red = nred  // neq
     gridpoints_out = npoints // neq
 
-    # Unpack — vectorised
-    rho = sol[0::neq]
-    u   = sol[1::neq]
-    w   = sol[2::neq]
-    e   = sol[3::neq]
+    # Unpack — vectorised.  Variable layout per grid point:
+    #   beta == 0 : rho, u, w, e        (v = 0)
+    #   beta != 0 : rho, u, v, w, e
+    zeros = np.zeros(gridpoints_red, dtype=np.complex128)
     if beta != 0.0:
-        v = sol[3::neq]   # for beta!=0 layout: rho,u,v,w,e
-        w = sol[4::neq] if neq >= 5 else np.zeros(gridpoints_red, dtype=np.complex128)
-        e = sol[4::neq] if neq >= 5 else sol[3::neq]
-        # Correct unpacking for beta!=0: rho,u,v,w,e
         rho = sol[0::neq]
         u   = sol[1::neq]
         v   = sol[2::neq]
         w   = sol[3::neq]
-        e   = sol[4::neq] if neq >= 5 else np.zeros(gridpoints_red, dtype=np.complex128)
+        e   = sol[4::neq] if neq >= 5 else zeros
     else:
-        v = np.zeros(gridpoints_red, dtype=np.complex128)
+        rho = sol[0::neq]
+        u   = sol[1::neq]
+        w   = sol[2::neq]
+        e   = sol[3::neq]
+        v   = zeros
 
     # Scatter to full mesh if domain-reduced
     def _to_full(arr):
