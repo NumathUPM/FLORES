@@ -165,12 +165,6 @@ class resolvant(object):
         self.iter += 1
         v1.destroy(); v2.destroy(); tmp.destroy()
 
-    def mult_transpose(self, mat, x, y):
-        """y <- A^H * x"""
-        x.conjugate()
-        self.ksp.solveTranspose(x, y)
-        y.conjugate()
-
     def operator(self, w):
         """Build L = iw*I - A and perform LU factorization via MUMPS."""
         Print = PETSc.Sys.Print
