@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Python environments created by python_env_installation/
+myvenv/
+myvenv_ompi/
+flores_env/
+
+# Run outputs
+LOG/
+RESULTS_*/
