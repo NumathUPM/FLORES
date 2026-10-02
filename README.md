@@ -248,7 +248,7 @@ mpirun -np 8 python solver/eig_solver.py eigensolver.ini
 
 Copyright (c) 2026 NUMATH https://numath.dmae.upm.es
 
-**Development:** Alejandro Martinez-Cava, Iván Padilla, Miguel Chávez-Modena, 
+**Development:** Alejandro Martinez-Cava, Iván Padilla, Miguel Chávez-Modena, Cian Mcdonnell
 
 **Original implementation:** The resolvent and eigenvalue solver architecture is based on the original code developed by **Alejandro Martínez Cava** as part of his doctoral thesis at the Universidad Politécnica de Madrid (UPM). His foundational work on the matrix-free resolvent operator and the PETSc/SLEPc solver infrastructure made this tool possible. Martínez-Cava Aguilar, Alejandro  (2019). Direct and Adjoint Methods for Highly Detached Flows. Tesis (Doctoral), E.T.S. de Ingeniería Aeronáutica y del Espacio (UPM). https://doi.org/10.20868/UPM.thesis.56391. 
 
