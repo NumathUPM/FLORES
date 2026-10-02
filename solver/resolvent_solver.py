@@ -605,6 +605,10 @@ def run_slices(params):
     # ── Frequency loop ────────────────────────────────────────────────────────
     mpd = ncv - 1
 
+    # Size of the forcing space: two momentum components per grid point
+    # (columns of the prolongation matrix P, see resolvant.pcreate)
+    nforce = 2 * (n // neq)
+
     for i_omega, omega in enumerate(listomegas):
 
         t0_omega = time.time()
@@ -616,7 +620,7 @@ def run_slices(params):
         t0      = time.time()
         A_omega = A.copy()
         R = PETSc.Mat().create()
-        R.setSizes([n//2, n//2])
+        R.setSizes([nforce, nforce])
         R.setType('python')
         shell = resolvant(n=n, Minv=Binv, Qe=Q, J=A_omega, w=omega, neq=neq)
         R.setPythonContext(shell)
@@ -718,7 +722,7 @@ def run_slices(params):
             Print(' SOLVING ADJOINT PROBLEM (reusing LU)')
 
             R_adj = PETSc.Mat().create()
-            R_adj.setSizes([n//2, n//2])
+            R_adj.setSizes([nforce, nforce])
             R_adj.setType('python')
             shell_adj = resolvant_adjoint(shell)
             R_adj.setPythonContext(shell_adj)
