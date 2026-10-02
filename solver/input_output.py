@@ -39,8 +39,13 @@ def openjacobian(jacfile):
     mjac.eliminate_zeros()
     return mjac, neq
 
-def open_sod2d_jacobian(jacfile):
+def open_sod2d_jacobian(input_path,jacfile):
     # read from SOD2D's WIP hdf format
+
+    hdfs_in_path = [x for x in os.listdir(input_path) if x.endswith(".hdf")]
+    if len(hdfs_in_path)>1:
+        print(" Detected multiple SOD2D hdfs, reading as split Jacobian...")
+        return open_split_sod2d_jacobian(input_path)
 
     f = h5py.File(jacfile,'r')
 
@@ -60,41 +65,65 @@ def open_sod2d_jacobian(jacfile):
 
     return mjac, neq
 
-def open_split_sod2d_jacobian(jacfiles):
+def open_split_sod2d_jacobian(input_path):
     # read from SOD2D's WIP hdf format
-    # uses the "split parallel" format where multiple hdfs contain a single matrix
+    # uses the "split parallel" format where multiple hdfs each contain part of a single matrix
 
-    sorted_files = sorted(jacfiles)
+    # sorts files in lexicographical order
+    # for less than 10 procs, if filenames remain unchanged 
+    # from their output in SOD2D, this will ensure
+    # matrix cols are added in correct order
+    sorted_files = sorted([os.path.join(input_path, single_file) for single_file in os.listdir(input_path)])
 
     nnz = 0
     num_cols = 0
-    for jacfile in jacfiles:
+    for jacfile in sorted_files:
     
         f = h5py.File(jacfile,'r')
-        nnz += f['col_ptr'][-1]
-        num_cols += len(f['col_ptr'][:])-1 # TODO might fail
+        col_ptr_with_zeros = np.array(f['col_ptr'],dtype=np.int32)
+        vals = np.array(f['values'],dtype=np.int32)
+
+        filtered_col_ptr = filter_col_ptr(col_ptr_with_zeros)
+        nnz += len(vals)
+        num_cols += len(filtered_col_ptr) # TODO might fail
         f.close()
 
-    col_ptr = np.zeros(num_cols,dtype=np.int32)
-    row_ind = np.zeros(nnz,dtype=np.int32)
-    values = np.zeros(nnz,dtype=np.float64)
-    coords = np.zeros(num_cols//5,dtype=np.float64) # TODO might be wrong
+    col_ptr = np.zeros(num_cols+1,dtype=np.int32)
+    row_ind = np.zeros(int(nnz),dtype=np.int32)
+    values = np.zeros(int(nnz),dtype=np.float64)
+    coords = np.zeros((num_cols//5,3),dtype=np.float64) # TODO might be wrong
 
     previous_col = 0
     current_col = 0
     previous_nnz = 0
     current_nnz = 0
-    for jacfile in jacfiles:
+
+    got_coords = False
+    indice = 1
+    for jacfile in sorted_files:
     
         f = h5py.File(jacfile,'r')
-        current_nnz = previous_nnz + f['col_ptr'][-1]
-        current_col = previous_col+len(f['col_ptr'][:])-1
-        col_ptr[previous_col:current_col-1] = previous_nnz + f['col_ptr'][:]
-        row_ind[previous_nnz:current_nnz-1] = f['row_ind'][:]
-        values[previous_nnz:current_nnz-1] = f['values'][:]
-        coords[previous_col//5:current_col//5] = f['node_coords'][:]
+
+        current_col_ptr_with_zeros = np.array(f['col_ptr'],dtype=np.int32)
+        current_filtered_col_ptr = filter_col_ptr(current_col_ptr_with_zeros)
+
+        current_nnz = previous_nnz + current_filtered_col_ptr[-1]
+        current_col = previous_col + len(current_filtered_col_ptr)
+        col_ptr[previous_col+1:current_col+1] = previous_nnz + current_filtered_col_ptr
+        row_ind[previous_nnz:current_nnz] = f['row_ind'][:]
+        values[previous_nnz:current_nnz] = f['values'][:]
+        # the node coords are currently output the same across all files of the "split"; only need reading once
+        if(not got_coords):
+            got_coords = True
+            coords = np.array(f['node_coords'][:],dtype=np.float64)
 
         f.close()
+        previous_col = current_col
+        previous_nnz = current_nnz
+        indice += 1
+
+    print(f"Got a nnz total of {col_ptr[-1]} which should match size of row_ind, which is {len(row_ind)}")
+    
 
     n = len(col_ptr)-1
     numpoints = np.shape(coords)[0]
@@ -107,6 +136,10 @@ def open_split_sod2d_jacobian(jacfiles):
 
     return mjac, neq
 
+def filter_col_ptr(initial_col_ptr):
+    
+    filtered_col_ptr = initial_col_ptr[initial_col_ptr != 0]
+    return filtered_col_ptr
 # -------------------------------------------------------------------- #
 
 def openqe(jacfile):

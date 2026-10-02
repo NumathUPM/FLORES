@@ -466,7 +466,7 @@ def run_slices(params):
     Print(' Reading Jacobian')
     if rank == 0:
         if(is_simulator_sod2d):
-            amatrix, neq = open_sod2d_jacobian(jacfile)
+            amatrix, neq = open_sod2d_jacobian(input_path,jacfile)
         else:
             amatrix, neq = openjacobian(jacfile)
         amatrix.data *= fac
