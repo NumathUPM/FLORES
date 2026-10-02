@@ -1,0 +1,64 @@
+# ============================================================
+#  EIGENSOLVER control file
+#  Usage:  python eig_solver.py eigensolver.floresparam
+#          mpirun -n 4 python eig_solver.py eigensolver.floresparam
+# ============================================================
+
+[io]
+# Directory containing the Jacobian, volumes and coordinates files
+input_path  = ./JAC/
+
+# Directory where eigenvalues (.dat) and eigenvectors (.pval) will be written
+# Created automatically if it does not exist
+output_path = ./RESULTS_eig
+
+# File names inside input_path (defaults shown — change only if non-standard)
+jac_file    = samg.matrix.amg.pval
+vol_file    = samg.matrix.vol
+coord_file  = samg.matrix.coo
+
+[physics]
+# Mach number of the base flow
+mach    = 0.2
+
+# Spanwise wavenumber (0.0 for a purely 2-D problem)
+beta    = 0.0 
+# Reference length used when reading coordinates (domain reduction only)
+rlength = 1.0 
+
+
+[solver]
+# Number of eigenvalues to request from SLEPc
+nev = 1
+ncv = 20
+
+#tol = 1e-8
+#max_it = 15000
+
+# Spectral shift  (real and imaginary parts stored separately)
+# shift = -0.05 + 0.115*2*pi*1i;
+shift_real = -0.05
+shift_imag =  0.7226
+
+# False  -> only direct problem  A x = lambda x
+# True   -> direct + adjoint     A^H y = lambda* y
+adjoint = True
+ 
+# Compute structural sensitivity
+# Requires adjoint = True (enabled automatically if not set)
+sensitivity = True
+
+[domain_reduction]
+enabled = False
+xmin    =  -10.0
+xmax    =  30.0
+zmin    = -10.0
+zmax    =  10.0
+
+[checkpoint]
+# Tolerances for detecting duplicate eigenvalues across runs
+# An eigenvalue is considered a duplicate if BOTH conditions are met:
+#   |Re(new) - Re(old)| < dup_tol_real
+#   |Im(new) - Im(old)| < dup_tol_imag
+dup_tol_real = 1e-5 
+dup_tol_imag = 1e-5 
