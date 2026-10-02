@@ -405,8 +405,10 @@ def run_slices(params):
 
     fac = 1. / (mach * np.sqrt(1.4))
 
-    if not os.path.isdir(output_path):
-        os.mkdir(output_path)
+    if rank == 0:
+        if not os.path.isdir(output_path):
+            os.mkdir(output_path)
+    comm.Barrier()  # all ranks wait until rank 0 has created the output dir
 
     # ── Print run summary ────────────────────────────────────────────────────
     Print('')
