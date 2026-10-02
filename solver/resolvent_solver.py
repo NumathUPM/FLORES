@@ -45,6 +45,8 @@ def read_control_file(filepath):
         [io]
             input_path          : path to Jacobian and volume files
             output_path         : path for output files
+            jac_file            : Jacobian filename    (default: samg.matrix.amg.pval)
+            vol_file            : volumes filename     (default: samg.matrix.vol)
             coord_file          : coordinates filename (default: samg.matrix.coo)
 
         [physics]
@@ -65,6 +67,8 @@ def read_control_file(filepath):
             nev                 : number of eigenvalues requested
             ncv                 : number of column vectors
             shift               : spectral shift (real)
+            tol                 : EPS convergence tolerance (default: 1e-6)
+            max_it              : EPS maximum iterations    (default: 1000)
             compute_sensitivity : True/False
 
         [domain_reduction]
@@ -85,6 +89,10 @@ def read_control_file(filepath):
     # [io]
     params['input_path']  = cfg.get('io', 'input_path').strip()
     params['output_path'] = cfg.get('io', 'output_path').strip()
+    params['jac_file']    = cfg.get('io', 'jac_file',
+                                    fallback='samg.matrix.amg.pval').strip()
+    params['vol_file']    = cfg.get('io', 'vol_file',
+                                    fallback='samg.matrix.vol').strip()
     params['coord_file']  = cfg.get('io', 'coord_file',
                                     fallback='samg.matrix.coo').strip()
 
@@ -105,6 +113,8 @@ def read_control_file(filepath):
     params['nev']                 = cfg.getint    ('solver', 'nev')
     params['ncv']                 = cfg.getint    ('solver', 'ncv')
     params['shift']               = cfg.getfloat  ('solver', 'shift')
+    params['tol']                 = cfg.getfloat  ('solver', 'tol',    fallback=1e-6)
+    params['max_it']              = cfg.getint    ('solver', 'max_it', fallback=1000)
     params['adjoint']             = cfg.getboolean('solver', 'adjoint',             fallback=False)
     params['compute_sensitivity'] = cfg.getboolean('solver', 'compute_sensitivity', fallback=False)
 
@@ -390,14 +400,16 @@ def run_slices(params):
     nev                 = params['nev']
     ncv                 = params['ncv']
     shift               = params['shift']
+    tol                 = params['tol']
+    max_it              = params['max_it']
     adjoint             = params['adjoint']
     compute_sensitivity = params['compute_sensitivity']
     dreduced            = params['dreduced']
     xmin                = params['xmin'];  xmax = params['xmax']
     zmin                = params['zmin'];  zmax = params['zmax']
 
-    jacfile = os.path.join(input_path, 'samg.matrix.amg.pval')
-    volfile = os.path.join(input_path, 'samg.matrix.vol')
+    jacfile = os.path.join(input_path, params['jac_file'])
+    volfile = os.path.join(input_path, params['vol_file'])
     coofile = os.path.join(input_path, params['coord_file'])
 
     if rank == 0:
@@ -412,11 +424,13 @@ def run_slices(params):
     Print(' ========================================')
     Print(' Input path  : {0}'.format(input_path))
     Print(' Output path : {0}'.format(output_path))
+    Print(' Jacobian    : {0}'.format(jacfile))
     Print(' Mach        : {0}'.format(mach))
     Print(' beta        : {0}'.format(beta))
     Print(' nev         : {0}'.format(nev))
     Print(' ncv         : {0}'.format(ncv))
     Print(' shift       : {0}'.format(shift))
+    Print(' tol / max_it: {0} / {1}'.format(tol, max_it))
     Print(' Adjoint     : {0}'.format(adjoint))
     Print(' Sensitivity : {0}'.format(compute_sensitivity))
     Print(' Dom. reduc. : {0}'.format(dreduced))
@@ -645,7 +659,7 @@ def run_slices(params):
         E.setOperators(R)
         E.setProblemType(SLEPc.EPS.ProblemType.NHEP)
         E.setType('krylovschur')
-        E.setTolerances(tol=1e-6, max_it=1000)
+        E.setTolerances(tol=tol, max_it=max_it)
         E.setDimensions(nev, ncv, mpd)
         if shift != 0.0:
             ST = E.getST()
@@ -743,7 +757,7 @@ def run_slices(params):
             E_adj.setOperators(R_adj)
             E_adj.setProblemType(SLEPc.EPS.ProblemType.NHEP)
             E_adj.setType('krylovschur')
-            E_adj.setTolerances(tol=1e-6, max_it=1000)
+            E_adj.setTolerances(tol=tol, max_it=max_it)
             E_adj.setDimensions(nev, ncv, mpd)
             E_adj.setFromOptions()
             E_adj.solve()
