@@ -8,11 +8,10 @@ import sys, os
 import time
 import gc
 import configparser
-from scipy.sparse import csr_matrix
 from jac_red import domain_reduction
 from save2pval import mode2pval
 from input_output import openjacobian, read_coordinates
-from mpi_utils import assemble_aij, assemble_diag
+from mpi_utils import assemble_aij, assemble_diag, ownership_ranges
 
 import petsc4py
 import slepc4py
@@ -199,44 +198,37 @@ class resolvant(object):
         self.J = None; self.Q = None; self.Minv = None
 
     def pcreate(self, neq):
-        """Build prolongation matrix P."""
+        """
+        Build the prolongation matrix P (N x 2N/neq): forcing component 2k
+        acts on DOF k*neq+1 and component 2k+1 on DOF k*neq+2 (the two
+        momentum equations of grid point k).
+
+        Each rank builds only its own rows, with the same row layout as A
+        and the same column layout as the shell operator.
+        """
         comm  = MPI.COMM_WORLD
-        size  = comm.Get_size()
+        rank  = comm.Get_rank()
+        nproc = comm.Get_size()
         Print = PETSc.Sys.Print
 
         dimrows = self.N
-        dimcol  = 2 * dimrows // neq
-        irn = np.zeros(dimcol)
-        jcn = np.zeros(dimcol)
-        val = np.ones(dimcol)
-        for i in range(dimcol):
-            jcn[i] = i
-        j = 0
-        for i in range(0, dimrows, neq):
-            irn[j]   = i + 1
-            irn[j+1] = i + 2
-            j += 2
-        ppy = csr_matrix((val, (irn, jcn)), shape=(dimrows, dimcol))
+        dimcol  = 2 * (dimrows // neq)
+        rs, re  = ownership_ranges(dimrows, nproc)[rank]
+        cs, ce  = ownership_ranges(dimcol,  nproc)[rank]
 
-        self.P = PETSc.Mat()
-        self.P.create(PETSc.COMM_WORLD)
-        self.P.setSizes([dimrows, dimcol])
-        self.P.setFromOptions()
-        self.P.setUp()
+        rows  = np.arange(rs, re)
+        comp  = rows % neq
+        has   = (comp == 1) | (comp == 2)
+        cols  = (2 * (rows // neq) + (comp - 1))[has]
+        indptr  = np.concatenate([[0], np.cumsum(has)]).astype(PETSc.IntType)
+        indices = cols.astype(PETSc.IntType)
+        values  = np.ones(indices.size, dtype=PETSc.ScalarType)
 
-        nnz_row   = ppy.getnnz(axis=1)
-        nnz_count = np.concatenate([[0], np.cumsum(nnz_row)])
-        RowStart, RowEnd = self.P.getOwnershipRange()
-        nrows     = RowEnd - RowStart
-        nnz_start = nnz_count[RowStart]
-        nnz_end   = nnz_count[RowEnd]
-        row_proc  = [(ppy.indptr[RowStart+i] - ppy.indptr[RowStart])
-                     for i in range(nrows+1)]
-        row_proc[0] = 0
-        col_proc = ppy.indices[nnz_start:nnz_end]
-        val_proc = ppy.data[nnz_start:nnz_end]
         Print(' Assembling P PETSc matrix...')
-        self.P.setPreallocationCSR((row_proc, col_proc, val_proc))
+        self.P = PETSc.Mat().createAIJ(size=((re - rs, dimrows),
+                                             (ce - cs, dimcol)),
+                                       csr=(indptr, indices, values),
+                                       comm=PETSc.COMM_WORLD)
         self.P.assemble()
 
 
