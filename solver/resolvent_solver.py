@@ -8,10 +8,11 @@ import sys, os
 import time
 import gc
 import configparser
-from scipy.sparse import csr_matrix, identity
+from scipy.sparse import csr_matrix
 from jac_red import domain_reduction
 from save2pval import mode2pval
 from input_output import openjacobian, read_coordinates
+from mpi_utils import assemble_aij, assemble_diag
 
 import petsc4py
 import slepc4py
@@ -321,55 +322,6 @@ def compute_sensitivity_field(direct_vec, adjoint_vec, B, nvars, n, neq,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PETSc matrix helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_petsc_mat(scipy_mat, n, label, comm):
-    """Assemble a general sparse PETSc matrix from a scipy CSR matrix."""
-    Print = PETSc.Sys.Print
-    M = PETSc.Mat()
-    M.create(comm)
-    M.setSizes([n, n])
-    M.setFromOptions()
-    M.setUp()
-
-    RS, RE = M.getOwnershipRange()
-    nr     = RE - RS
-    nnz_row   = scipy_mat.getnnz(axis=1)
-    nnz_count = np.concatenate([[0], np.cumsum(nnz_row)])
-    ns = nnz_count[RS]
-    ne = nnz_count[RE]
-    rp = [(scipy_mat.indptr[RS+i] - scipy_mat.indptr[RS]) for i in range(nr+1)]
-    rp[0] = 0
-
-    indptr_local  = np.array(rp, dtype=PETSc.IntType)
-    indices_local = scipy_mat.indices[ns:ne].astype(PETSc.IntType)
-    values_local  = scipy_mat.data[ns:ne].astype(PETSc.ScalarType)
-    M.setValuesCSR(indptr_local, indices_local, values_local)
-    M.assemble()
-    Print(' Assembled {0}'.format(label))
-    return M
-
-
-def make_diag_petsc(data_vec, n, label, comm):
-    """Assemble a diagonal PETSc matrix using setDiagonal (vectorized)."""
-    Print = PETSc.Sys.Print
-    M = PETSc.Mat()
-    M.create(comm)
-    M.setSizes([n, n])
-    M.setFromOptions()
-    M.setUp()
-
-    RS, RE    = M.getOwnershipRange()
-    diag_vals = data_vec[RS:RE].astype(PETSc.ScalarType)
-    diag_vec  = PETSc.Vec().createWithArray(diag_vals, comm=comm)
-    M.setDiagonal(diag_vec)
-    M.assemble()
-    Print(' Assembled {0}'.format(label))
-    return M
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -467,6 +419,7 @@ def run_slices(params):
                           + jm1*np.exp(-1j*beta*dy))
             amatrix = amatrix.tocsr()
             del midrow, jm1, j0, j1
+        del mjac
 
         n   = amatrix.shape[0]
         nnz = amatrix.nnz
@@ -477,21 +430,6 @@ def run_slices(params):
     comm.Bcast(meta, root=0)
     neq, nvars, n, nnz = int(meta[0]), int(meta[1]), int(meta[2]), int(meta[3])
 
-    if rank == 0:
-        indptr_buf  = amatrix.indptr.astype(np.int32)
-        indices_buf = amatrix.indices.astype(np.int32)
-        data_buf    = amatrix.data.astype(np.complex128)
-        del amatrix, mjac
-    else:
-        indptr_buf  = np.empty(n + 1, dtype=np.int32)
-        indices_buf = np.empty(nnz,   dtype=np.int32)
-        data_buf    = np.empty(nnz,   dtype=np.complex128)
-
-    comm.Bcast(indptr_buf,  root=0)
-    comm.Bcast(indices_buf, root=0)
-    comm.Bcast(data_buf,    root=0)
-
-    amatrix    = csr_matrix((data_buf, indices_buf, indptr_buf), shape=(n, n))
     gridpoints = n // neq
     _t(comm, rank, 'Jacobian read', t0)
 
@@ -511,19 +449,11 @@ def run_slices(params):
         vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
     comm.Bcast(vols_buf, root=0)
 
-    vols_repeated = np.repeat(vols_buf, neq)
+    b_data = np.repeat(vols_buf, neq).astype(np.complex128)   # diag(M)
     del vols_buf
-
-    bmatrix  = identity(n, dtype='c16', format='csr')
-    mmatinv  = identity(n, dtype='c16', format='csr')
-    qematrix = identity(n, dtype='c16', format='csr')
-    bmatrix.data[:]  = vols_repeated.astype(np.complex128)
-    mmatinv.data[:]  = (1.0 / vols_repeated).astype(np.complex128)
-    qematrix.data[:] = vols_repeated.astype(np.complex128)
-    del vols_repeated
     _t(comm, rank, 'Mass matrix build', t0)
 
-    # ── Domain reduction — rank 0 only, then broadcast ───────────────────────
+    # ── Domain reduction — rank 0 only; only vectors are broadcast ───────────
     t0   = time.time()
     rgid = None
     if dreduced:
@@ -538,68 +468,28 @@ def run_slices(params):
 
             nnz_before = amatrix.nnz
             amatrix    = dr.reduce_matrix(amatrix)
-            bmatrix    = dr.reduce_matrix(bmatrix)
-            qematrix   = dr.reduce_matrix(qematrix)
-            mmatinv    = dr.reduce_matrix(mmatinv)
+            b_data     = dr.reduce_vector(b_data)
             n_red      = amatrix.shape[0]
 
             localid = np.repeat(np.arange(0, gridpoints, 1, dtype='i4'), neq)
-            rgid    = dr.reduce_vector(localid)[0::neq].astype(int)
+            rgid    = dr.reduce_vector(localid)[0::neq].astype(np.int64)
             del localid
 
             Print(' Previous NNZ = {0}'.format(nnz_before))
             Print(' New NNZ      = {0}'.format(amatrix.nnz))
             Print(' New leading dimension = {0}'.format(n_red))
             Print('')
-
-            # Pack for broadcast
-            a_indptr  = amatrix.indptr.astype(np.int32)
-            a_indices = amatrix.indices.astype(np.int32)
-            a_data    = amatrix.data.astype(np.complex128)
-            b_data    = bmatrix.data.astype(np.complex128)
-            q_data    = qematrix.data.astype(np.complex128)
-            bi_data   = mmatinv.data.astype(np.complex128)
-            meta_dr   = np.array([n_red, amatrix.nnz, len(rgid)],
-                                  dtype=np.int64)
+            meta_dr = np.array([n_red, len(rgid)], dtype=np.int64)
         else:
-            meta_dr   = np.empty(3,  dtype=np.int64)
-            a_indptr  = None; a_indices = None; a_data  = None
-            b_data    = None; q_data    = None; bi_data = None
-            rgid      = None
+            meta_dr = np.empty(2, dtype=np.int64)
 
-        # Broadcast metadata
         comm.Bcast(meta_dr, root=0)
-        n_red, nnz_red, ngrid_red = (int(meta_dr[0]),
-                                     int(meta_dr[1]),
-                                     int(meta_dr[2]))
-
-        # Broadcast sparse arrays
+        n_red, ngrid_red = int(meta_dr[0]), int(meta_dr[1])
         if rank != 0:
-            a_indptr  = np.empty(n_red + 1, dtype=np.int32)
-            a_indices = np.empty(nnz_red,   dtype=np.int32)
-            a_data    = np.empty(nnz_red,   dtype=np.complex128)
-            b_data    = np.empty(n_red,     dtype=np.complex128)
-            q_data    = np.empty(n_red,     dtype=np.complex128)
-            bi_data   = np.empty(n_red,     dtype=np.complex128)
-            rgid      = np.empty(ngrid_red, dtype=np.int64)
-
-        comm.Bcast(a_indptr,  root=0)
-        comm.Bcast(a_indices, root=0)
-        comm.Bcast(a_data,    root=0)
-        comm.Bcast(b_data,    root=0)
-        comm.Bcast(q_data,    root=0)
-        comm.Bcast(bi_data,   root=0)
-        comm.Bcast(rgid,      root=0)
-
-        # Reconstruct scipy matrices on all ranks
-        amatrix  = csr_matrix((a_data, a_indices, a_indptr),
-                               shape=(n_red, n_red))
-        bmatrix  = identity(n_red, dtype='c16', format='csr')
-        qematrix = identity(n_red, dtype='c16', format='csr')
-        mmatinv  = identity(n_red, dtype='c16', format='csr')
-        bmatrix.data[:]  = b_data
-        qematrix.data[:] = q_data
-        mmatinv.data[:]  = bi_data
+            b_data = np.empty(n_red,     dtype=np.complex128)
+            rgid   = np.empty(ngrid_red, dtype=np.int64)
+        comm.Bcast(b_data, root=0)
+        comm.Bcast(rgid,   root=0)
 
         n    = n_red
         rgid = rgid.astype(int)
@@ -607,17 +497,24 @@ def run_slices(params):
     _t(comm, rank, 'Domain reduction', t0)
 
     # ── Assemble PETSc matrices ───────────────────────────────────────────────
+    # Rank 0 sends each rank only the rows it owns (no full-matrix copies).
     t0  = time.time()
     fac = 1. / (mach * np.sqrt(1.4))
-    amatrix_scaled      = amatrix.copy()
-    amatrix_scaled.data *= fac
+    if rank == 0:
+        amatrix.data *= fac
 
-    A    = make_petsc_mat(amatrix_scaled, n, 'A (Jacobian)',        PETSc.COMM_WORLD)
-    B    = make_diag_petsc(bmatrix.data,  n, 'B (mass)',            PETSc.COMM_WORLD)
-    Binv = make_diag_petsc(mmatinv.data,  n, 'Binv (mass inverse)', PETSc.COMM_WORLD)
-    Q    = make_petsc_mat(qematrix,        n, 'Q (energy weight)',   PETSc.COMM_WORLD)
+    A    = assemble_aij(comm, amatrix if rank == 0 else None, n)
+    Print(' Assembled A (Jacobian)')
+    B    = assemble_diag(b_data,       n)
+    Print(' Assembled B (mass)')
+    Binv = assemble_diag(1.0 / b_data, n)
+    Print(' Assembled Binv (mass inverse)')
+    Q    = assemble_diag(b_data,       n)     # energy weight Q = M
+    Print(' Assembled Q (energy weight)')
 
-    del amatrix_scaled, bmatrix, mmatinv, qematrix, amatrix
+    if rank == 0:
+        del amatrix
+    del b_data
     gc.collect()
     _t(comm, rank, 'PETSc matrix assembly', t0)
 
