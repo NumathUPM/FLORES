@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-plot_gain_curve.py
+plot_gain.py
 ------------------
-Reads RESOLVANT.py output files  eigv_DIR_<omega>j.dat  and plots the
+Reads resolvent_solver.py output files  eigv_DIR_<omega>j.dat  and plots the
 optimal gain curve  lambda_1^2(omega)  vs omega.
 """
 
@@ -31,13 +31,13 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 if not args.dirs:
     print("""
-Usage: python plot_gain_curve.py [OPTIONS]
+Usage: python plot_gain.py [OPTIONS]
 
   Single directory  (plots lambda_1^2 and lambda_2^2):
-    python plot_gain_curve.py --dirs RESULTS_resolvent
+    python plot_gain.py --dirs RESULTS_resolvent
 
   Multiple directories  (one curve per case, only lambda_1^2):
-    python plot_gain_curve.py --dirs RESULTS_re1 RESULTS_re2 RESULTS_re3 \\
+    python plot_gain.py --dirs RESULTS_re1 RESULTS_re2 RESULTS_re3 \\
                               --labels "Re=1000" "Re=2000" "Re=3000"
 
   If --labels is omitted and directory names share a common prefix,

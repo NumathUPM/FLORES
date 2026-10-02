@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plot_pval_mode.py
+plot_pval_eigfunction.py
 -----------------
 Reads a .pval NetCDF file produced by mode2pval() and plots the
 eigenmode components on the 2D computational domain.
@@ -31,7 +31,7 @@ COORDINATES (one of these is required)
   TAU mesh NetCDF    : --mesh MESH/BFS_h4_2D.taumesh
 
 INPUT (one of these is required)
-  Single .pval file  : python plot_pval_mode.py path/to/eigf_0_1.2j.pval
+  Single .pval file  : python plot_pval_eigfunction.py path/to/eigf_0_1.2j.pval
   Mode sweep         : --modes 0-9          (range)
                        --modes 3            (single)
                        --modes 0 2 5        (list)
@@ -56,23 +56,23 @@ EXAMPLES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Sweep eigen-modes 0-20 using TAU mesh
-python plot_pval_mode.py --modes 0-20 --dir RESULTS_eig/ \\
+python plot_pval_eigfunction.py --modes 0-20 --dir RESULTS_eig/ \\
     --mesh MESH/BFS_h4_2D.taumesh
 
 # Resolvent results (auto-detected from directory name)
-python plot_pval_mode.py --modes 0-5 --dir RESULTS_resolvent/ \\
+python plot_pval_eigfunction.py --modes 0-5 --dir RESULTS_resolvent/ \\
     --mesh MESH/BFS_h4_2D.taumesh
 
 # Only forcing + response, restrict x window
-python plot_pval_mode.py --modes 0-5 --dir RESULTS_resolvent/ \\
+python plot_pval_eigfunction.py --modes 0-5 --dir RESULTS_resolvent/ \\
     --mesh MESH/BFS_h4_2D.taumesh --fields eigf eigr --xlim -2 15
 
 # Single file, both real and imaginary
-python plot_pval_mode.py RESULTS_eig/eigf_3_1.2j.pval \\
+python plot_pval_eigfunction.py RESULTS_eig/eigf_3_1.2j.pval \\
     --mesh MESH/BFS_h4_2D.taumesh --both
 
 # Sanity-check mesh geometry
-python plot_pval_mode.py --check-mesh --mesh MESH/BFS_h4_2D.taumesh
+python plot_pval_eigfunction.py --check-mesh --mesh MESH/BFS_h4_2D.taumesh
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -809,7 +809,7 @@ def compute_sensitivity(dir_data, adj_data, common, vol_path=None, neq=4):
     If vol_path is None, uses identity (no mass weighting).
 
     The inner product is computed over all variables jointly (full DOF vector),
-    matching eig_simple.py which uses the full Jacobian-sized vectors.
+    matching eig_solver.py which uses the full Jacobian-sized vectors.
 
     Returns a data dict {'u': sens_array, 'w': sens_array} with real values.
     """
@@ -852,7 +852,7 @@ def compute_sensitivity(dir_data, adj_data, common, vol_path=None, neq=4):
     print(f"  [sensitivity] |<q+, B q>| = {norm_ip:.4e}")
 
     # Pointwise sensitivity: element-wise product of magnitudes / norm_ip
-    # This matches eig_simple.py exactly:
+    # This matches eig_solver.py exactly:
     #   sensitivity = np.abs(adj_arr) * np.abs(dir_arr) / norm_ip
     # where adj_arr/dir_arr are the full DOF vectors (size n_nodes*neq_actual)
     # mode2pval stores the first gridpoints values -> DOF 0 of each node = rho

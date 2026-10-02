@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 #
-# Usage: python RESOLVANT.py resolvent.ini
-#        mpirun -n 4 python RESOLVANT.py resolvent.ini
+# Usage: python resolvent_solver.py case_resolvent.floresparam
+#        mpirun -n 4 python resolvent_solver.py case_resolvent.floresparam
 #
 import numpy as np
 import sys, os
@@ -40,7 +40,7 @@ def _t(comm, rank, label, t0):
 
 def read_control_file(filepath):
     """
-    Read parameters from a .ini control file.
+    Read parameters from a .floresparam (INI-format) control file.
 
     Expected sections and keys:
         [io]
@@ -736,8 +736,8 @@ def run_slices(params):
 if __name__ == "__main__":
 
     if len(sys.argv) < 2:
-        print('Usage: python RESOLVANT.py <control_file.ini>')
-        print('       mpirun -n 4 python RESOLVANT.py <control_file.ini>')
+        print('Usage: python resolvent_solver.py <control_file.floresparam>')
+        print('       mpirun -n 4 python resolvent_solver.py <control_file.floresparam>')
         sys.exit(1)
 
     ctrl_file = sys.argv[1]

@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 #
-# Usage: python eig_simple.py eigensolver.ini
-#        mpirun -n 4 python eig_simple.py eigensolver.ini
+# Usage: python eig_solver.py case_eig.floresparam
+#        mpirun -n 4 python eig_solver.py case_eig.floresparam
 #
 import numpy as np
 import sys, os
@@ -39,7 +39,7 @@ def _t(comm, rank, label, t0):
 
 def read_control_file(filepath):
     """
-    Read parameters from a .ini control file.
+    Read parameters from a .floresparam (INI-format) control file.
 
     Expected sections and keys:
 
@@ -115,7 +115,7 @@ def read_control_file(filepath):
     elif cfg.has_option('solver', 'shift'):
         p['shift'] = complex(cfg.get('solver', 'shift').strip())
     else:
-        raise ValueError('El .ini debe definir shift_real/shift_imag o shift en [solver]')
+        raise ValueError('The control file must define shift_real/shift_imag or shift in [solver]')
     p['tol']         = cfg.getfloat  ('solver', 'tol',         fallback=1e-8)
     p['max_it']      = cfg.getint    ('solver', 'max_it',      fallback=15000)
     p['adjoint']     = cfg.getboolean('solver', 'adjoint',     fallback=False)
@@ -771,8 +771,8 @@ def run_slices(params):
 if __name__ == "__main__":
 
     if len(sys.argv) < 2:
-        print('Usage: python eig_simple.py <control_file.ini>')
-        print('       mpirun -n 4 python eig_simple.py <control_file.ini>')
+        print('Usage: python eig_solver.py <control_file.floresparam>')
+        print('       mpirun -n 4 python eig_solver.py <control_file.floresparam>')
         sys.exit(1)
 
     ctrl_file = sys.argv[1]

@@ -97,12 +97,14 @@ A sanity check is run automatically at the end of each script, printing the PETS
 
 ## Usage
 
-Both solvers are configured through an `.ini` control file passed as a
-command-line argument, and can be run serially or in parallel via MPI.
+Both solvers are configured through an INI-format control file
+(`.floresparam`, see `test_cases/`) passed as a command-line argument, and
+can be run serially or in parallel via MPI. The full technical
+documentation is in [`doc/FLORES_Technical_Documentation.md`](doc/FLORES_Technical_Documentation.md).
 
 ### Global stability analysis (`solver/eig_solver.py`)
 
-Create a control file (e.g. `eigensolver.ini`):
+Create a control file (e.g. `case_eig.floresparam`):
 
 ```ini
 [io]
@@ -116,6 +118,7 @@ coord_file   = samg.matrix.coo
 mach    = 0.1
 beta    = 0.0
 rlength = 1.0
+output_slices = 21          # spanwise slices of the *3D.pval output (beta != 0)
 
 [solver]
 nev          = 50           # number of eigenvalues requested
@@ -145,10 +148,10 @@ Run:
 
 ```bash
 # Serial
-python solver/eig_solver.py eigensolver.ini
+python solver/eig_solver.py case_eig.floresparam
 
 # Parallel
-mpirun -np 8 python solver/eig_solver.py eigensolver.ini
+mpirun -np 8 python solver/eig_solver.py case_eig.floresparam
 ```
 
 Converged direct eigenvalues are appended to `RESULTS_eig/eigv_DIR.dat`
@@ -164,18 +167,22 @@ skipped automatically.
 
 ### Resolvent analysis (`solver/resolvent_solver.py`)
 
-Create a control file (e.g. `resolvent.ini`):
+Create a control file (e.g. `case_resolvent.floresparam`):
 
 ```ini
 [io]
 input_path   = JAC/
 output_path  = RESULTS_resolvent/
+jac_file     = samg.matrix.amg.pval
+vol_file     = samg.matrix.vol
 coord_file   = samg.matrix.coo
 
 [physics]
 mach    = 0.1
 beta    = 0.0
 rlength = 1.0
+nslices       = 7           # spanwise slices in the TAU Jacobian (beta != 0)
+slice_spacing = 1.0         # spanwise distance between slices  (beta != 0)
 
 [frequencies]
 omega_start = 10.0          # start of frequency sweep (imaginary part)
@@ -186,6 +193,8 @@ omega_n     = 50            # number of frequencies
 nev                  = 5    # number of singular values requested
 ncv                  = 20   # Krylov subspace size
 shift                = 0.0  # spectral shift
+tol                  = 1e-6 # SLEPc convergence tolerance
+max_it               = 1000 # maximum Krylov iterations
 adjoint              = False # set True to also run adjoint resolvent
 compute_sensitivity  = False # set True to compute resolvent sensitivity
                              # (automatically enables adjoint = True)
@@ -202,10 +211,10 @@ Run:
 
 ```bash
 # Serial
-python solver/resolvent_solver.py resolvent.ini
+python solver/resolvent_solver.py case_resolvent.floresparam
 
 # Parallel
-mpirun -np 8 python solver/resolvent_solver.py resolvent.ini
+mpirun -np 8 python solver/resolvent_solver.py case_resolvent.floresparam
 ```
 
 For each frequency `omega`, the optimal forcing modes are written to
@@ -239,7 +248,7 @@ of high structural sensitivity of the dominant mode.
 #SBATCH --time=24:00:00
 
 source myvenv/bin/activate
-mpirun -np 8 python solver/eig_solver.py eigensolver.ini
+mpirun -np 8 python solver/eig_solver.py case_eig.floresparam
 ```
 
 
