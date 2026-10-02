@@ -153,8 +153,8 @@ class resolvant(object):
 
     def mult(self, mat, x, y):
         """y <- D * x = P^T M^-1 (L*)^-1 Q L^-1 P x"""
-        v1, tmp = self.Q.getVecs()
-        v2, tmp = self.Q.getVecs()
+        v1, tmp = self.Q.createVecs()
+        v2, tmp = self.Q.createVecs()
         self.P.mult(x, v1)
         self.ksp.solve(v1, v2)
         self.Q.mult(v2, v1)
@@ -258,8 +258,8 @@ class resolvant_adjoint(object):
 
     def mult(self, mat, x, y):
         """y <- D* x = P^T M^-1 L^-1 Q (L*)^-1 P x"""
-        v1, tmp = self.Q.getVecs()
-        v2, tmp = self.Q.getVecs()
+        v1, tmp = self.Q.createVecs()
+        v2, tmp = self.Q.createVecs()
         self.P.mult(x, v1)
         v1.conjugate()
         self.ksp.solveTranspose(v1, v2)
@@ -287,7 +287,7 @@ def compute_sensitivity_field(direct_vec, adjoint_vec, B, nvars, n, neq,
     """
     Print = PETSc.Sys.Print
 
-    tmp_vec, _ = B.getVecs()
+    tmp_vec, _ = B.createVecs()
     B.mult(direct_vec, tmp_vec)
 
     scatter_d, dir_seq = PETSc.Scatter.toZero(direct_vec)
@@ -570,10 +570,10 @@ def run_slices(params):
         if rank == 0:
             print(' Converged: {0}  /  Saving: {1}'.format(nconv, nsave))
 
-        xr,      _ = shell.P.getVecs()
-        xi,      _ = shell.P.getVecs()
-        eigpre,  _ = A_omega.getVecs()
-        resppre, _ = A_omega.getVecs()
+        xr,      _ = shell.P.createVecs()
+        xi,      _ = shell.P.createVecs()
+        eigpre,  _ = A_omega.createVecs()
+        resppre, _ = A_omega.createVecs()
         eigs         = []
         direct_modes = []
 
@@ -614,7 +614,7 @@ def run_slices(params):
                 scatter_r.destroy(); respvec.destroy()
 
                 if adjoint and compute_sensitivity:
-                    mode_copy, _ = A_omega.getVecs()
+                    mode_copy, _ = A_omega.createVecs()
                     eigpre.copy(mode_copy)
                     direct_modes.append(mode_copy)
 
@@ -660,9 +660,9 @@ def run_slices(params):
                 print(' Adjoint converged: {0}  /  Saving: {1}'.format(
                     nconv_adj, nsave_adj))
 
-            xr_adj,     _ = shell.P.getVecs()
-            xi_adj,     _ = shell.P.getVecs()
-            eigpre_adj, _ = A_omega.getVecs()
+            xr_adj,     _ = shell.P.createVecs()
+            xi_adj,     _ = shell.P.createVecs()
+            eigpre_adj, _ = A_omega.createVecs()
             eigs_adj        = []
 
             t0 = time.time()

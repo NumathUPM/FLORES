@@ -310,7 +310,7 @@ def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
         q_adj = adj_vecs[i]
 
         # B * q_dir
-        Bq_dir, _ = B.getVecs()
+        Bq_dir, _ = B.createVecs()
         B.mult(q_dir, Bq_dir)
 
         # Gather to rank 0
@@ -582,8 +582,8 @@ def run_slices(params):
         print(' Iterations (EPS)        : ', its_dir)
         print(' Converged               : ', nconv_dir)
 
-    xr, _ = A.getVecs()
-    xi, _ = A.getVecs()
+    xr, _ = A.createVecs()
+    xi, _ = A.createVecs()
 
     new_dir_eigs  = []
     dir_vecs_kept = []   # PETSc Vecs for sensitivity (only new modes)
@@ -628,7 +628,7 @@ def run_slices(params):
 
             # Keep a copy in memory for sensitivity computation
             if sensitivity:
-                mode_copy, _ = A.getVecs()
+                mode_copy, _ = A.createVecs()
                 xr.copy(mode_copy)
                 dir_vecs_kept.append(mode_copy)
 
@@ -663,8 +663,8 @@ def run_slices(params):
             print(' Converged (adjoint modes) : ', nconv_adj)
 
         # Left eigenvectors retrieved from the same EPS object
-        yr, _ = A.getVecs()
-        yi, _ = A.getVecs()
+        yr, _ = A.createVecs()
+        yi, _ = A.createVecs()
 
         new_adj_eigs  = []
         adj_vecs_kept = []   # PETSc Vecs for sensitivity
@@ -717,7 +717,7 @@ def run_slices(params):
 
                 # Keep a copy for sensitivity
                 if sensitivity:
-                    adj_copy, _ = A.getVecs()
+                    adj_copy, _ = A.createVecs()
                     yr.copy(adj_copy)
                     adj_vecs_kept.append(adj_copy)
 
