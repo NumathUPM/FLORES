@@ -474,7 +474,7 @@ from the structural sensitivity (13) of the eigenvalue problem.
 | mpi4py | MPI bindings | built from source (`--no-binary`) |
 | PETSc | Parallel sparse linear algebra, **complex scalars** (`--with-scalar-type=complex`) | `release` branch (3.25 at time of writing) |
 | SLEPc | Eigenvalue solvers | `release` branch (3.25) |
-| petsc4py | Python bindings for PETSc | 3.25.0 (pinned) |
+| petsc4py | Python bindings for PETSc | 3.25.0 (pinned); also tested with 3.26 |
 | slepc4py | Python bindings for SLEPc | 3.25.0 (pinned) |
 | MUMPS | Sparse direct solver (LU) | 5.4.0 (module) or 5.5.1 (built by `_ompi` script) |
 | NumPy | Numerical arrays | any |
@@ -495,13 +495,15 @@ FLORES/
 │   ├── resolvent_solver.py    # Resolvent solver (matrix-free shell, direct + adjoint)
 │   ├── jac_red.py             # Domain-reduction utilities (class domain_reduction)
 │   ├── input_output.py        # Readers: TAU Jacobian (NetCDF), coordinates (.coo)
+│   ├── mpi_utils.py           # Row distribution of the Jacobian and PETSc assembly
 │   └── save2pval.py           # Writers: modes → TAU .pval (2-D and 3-D expansion)
 ├── tools/
 │   ├── plot_eigenvalues.py        # Spectrum in the complex plane
 │   ├── plot_gain.py               # Resolvent gain curve λ²(ω)
 │   └── plot_pval_eigfunction.py   # 2-D mode / sensitivity visualisation
 ├── test_cases/
-│   └── BFS/                       # Backward-facing step: .floresparam + SLURM scripts
+│   ├── BFS/                       # Backward-facing step: .floresparam + SLURM scripts
+│   └── Cylinder_Re45/             # Cylinder wake, Re = 45: eigenvalue .floresparam
 ├── python_env_installation/
 │   ├── Cesvima_UPM_Installation.sh       # CESVIMA, MUMPS from module
 │   ├── Cesvima_UPM_Installation_ompi.sh  # CESVIMA, MUMPS 5.5.1 built with OpenMP
@@ -514,9 +516,7 @@ FLORES/
 
 The original LaTeX document referred to the old scripts `EIGENSOLVER.py`,
 `RESOLVANT.py`, `eig_simple.py` and to a `post_processing/` folder. They are
-now `solver/eig_solver.py`, `solver/resolvent_solver.py` and `tools/`. The
-docstrings and the `Usage:` messages inside the solvers still mention the old
-names.
+now `solver/eig_solver.py`, `solver/resolvent_solver.py` and `tools/`.
 
 **Input files** (in `input_path`):
 
@@ -554,11 +554,12 @@ Shared features:
 - **checkpoint/resume** with duplicate detection
   ([§6.6](#66-checkpoint-and-resume));
 - consecutive numbering of eigenvector files across runs;
-- MPI broadcast of the CSR arrays with `comm.Bcast` (buffers, no pickle);
+- the Jacobian is read on rank 0 and each rank receives only its own rows
+  (`mpi_utils.assemble_aij`, [§6.2](#62-matrix-assembly));
 - per-phase timing with `_t()`;
 - optional domain reduction ([Chapter 5](#5-domain-reduction));
-- for `beta != 0`, an additional 3-D expanded file (`*3D.pval`) with 21
-  spanwise slices (hard-coded).
+- for `beta != 0`, an additional 3-D expanded file (`*3D.pval`) with
+  `[physics] output_slices` spanwise slices (default 21).
 
 #### 2.3.2 `solver/resolvent_solver.py` — resolvent solver
 
@@ -583,13 +584,14 @@ Implements the resolvent as a **matrix-free shell operator** in PETSc/SLEPc:
 
 | Module | Main functions |
 |---|---|
-| `input_output.py` | `openjacobian()` (TAU Jacobian → CSR + `neq`), `read_coordinates()` (vectorised `.coo` reader; detects `neq` from repeated rows; duplicates rows when `beta != 0`). Also contains legacy readers (`openegvec`, `openresidual`, `openbflow`, `opensensitivity`, `opendualgrid`, `openqe`) that the solvers do not use. |
+| `input_output.py` | `openjacobian()` (TAU Jacobian → CSR + `neq`), `read_coordinates()` (vectorised `.coo` reader; detects `neq` from repeated rows; duplicates rows when `beta != 0`). Also contains readers for TAU modes, residuals, base flows and sensitivities (`openegvec`, `openresidual`, `openbflow`, `opensensitivity`, `opendualgrid`, `openqe`) that the solvers do not use. |
+| `mpi_utils.py` | `ownership_ranges()` (PETSc default row split), `scatter_csr_rows()` (rank 0 sends each rank its rows), `assemble_aij()` (distributed AIJ matrix with CSR preallocation), `assemble_diag()` (diagonal matrices with the same layout). |
 | `jac_red.py` | Class `domain_reduction`: `create_Pmatrix(coords)`, `reduce_matrix(A)`, `reduce_vector(v)`. |
-| `save2pval.py` | `mode2pval()` (complex mode → `.pval` with variables `rho, u, w, e[, turb1, turb2]` and their `_i` imaginary parts), `mode2pval3D()` (spanwise expansion), and unused functions `sol2pval()`, `sens2pval()`. |
+| `save2pval.py` | `mode2pval()` (complex mode → `.pval` with variables `rho, u, w, e[, turb1, turb2]` and their `_i` imaginary parts), `mode2pval3D()` (spanwise expansion), and functions not used by the solvers, `sol2pval()` and `sens2pval()`. |
 
-> ⚠️ Legacy functions in `input_output.py` still use Python 2 semantics
-> (`i/neq` used as an index). `sens2pval()` creates the variable `rho` twice.
-> Neither is used by the current solvers.
+> `mode2pval()` writes `global_id = 0 … 2·gridpoints−1`, not the TAU
+> `global_id`. The Jacobian file does not contain the TAU ids, so this assumes
+> the TAU point ordering is the natural one.
 
 ---
 
@@ -700,8 +702,12 @@ Contents of the folder:
 | `script_resolvent.slurm` | same, with `resolvent_solver.py` |
 | `script_plot_eigf.slurm` | Runs `plot_pval_eigfunction.py` |
 
-> ⚠️ The `.floresparam` and `.slurm` files contain absolute paths of a
-> CESVIMA user (`/home/w059/...`). Adapt them before use.
+The scripts use `${FLORES_DIR}` (path to the repository) and source a
+site-specific `load_env_*.sh`, which must be provided by the user
+([§3.3](#33-environment-activation)).
+
+`test_cases/Cylinder_Re45/Cylinder_eig.floresparam` contains an eigenvalue
+set-up for the cylinder wake at Re = 45.
 
 The original documentation describes the following TAU set-ups. The
 Jacobians and meshes are **not** in the repository.
@@ -744,9 +750,6 @@ TAU set-up:
 | CFL | 2 |
 | MPI domains (TAU) | 12 |
 | 2-D extrusion axis | $Y$ (offset = 2) |
-
-> The `main` branch also contains the case `test_cases/Cylinder_Re45`, which
-> has not yet been brought into `miguel_dev`.
 
 ---
 
@@ -871,6 +874,7 @@ coord_file   = samg.matrix.coo       # default
 mach    = 0.31
 beta    = 0.0        # spanwise wavenumber (0 = 2-D)
 rlength = 1.0        # coordinate scale (domain reduction only)
+output_slices = 21   # spanwise slices of the *3D.pval output (beta != 0)
 
 [solver]
 nev          = 20
@@ -904,27 +908,26 @@ option can be passed on the command line (`-eps_*`, `-st_*`,
 
 #### Jacobian $\mathbf{A}$
 
-Rank 0 reads the Jacobian, scales it by $1/(M_\infty\sqrt{1.4})$ and
-broadcasts the three CSR arrays. **Every rank reconstructs the full SciPy
-matrix** and inserts only its own rows:
+Only **rank 0** reads the Jacobian, scales it by $1/(M_\infty\sqrt{1.4})$
+and, if enabled, applies the domain reduction. It then sends each rank only
+the block of rows that rank owns (`mpi_utils.assemble_aij`):
 
 ```python
-rstart, rend  = A.getOwnershipRange()
-indptr_local  = amatrix.indptr[rstart:rend+1].copy()
-indices_local = amatrix.indices[indptr_local[0]:indptr_local[-1]].copy()
-values_local  = amatrix.data   [indptr_local[0]:indptr_local[-1]].copy()
-indptr_local  = (indptr_local - indptr_local[0]).astype(PETSc.IntType)
-A.setValuesCSR(indptr_local, indices_local.astype(PETSc.IntType),
-               values_local.astype(PETSc.ScalarType))
+# mpi_utils.py (simplified)
+ranges = ownership_ranges(n, nproc)          # PETSc default row split
+# rank 0: for each rank r, slice rows ranges[r] and comm.Send them
+# rank r: comm.Recv its local indptr (0-based), indices, data
+A = PETSc.Mat().createAIJ(size=((nloc, n), (nloc, n)),
+                          csr=(indptr, indices, data),
+                          comm=PETSc.COMM_WORLD)
 A.assemble()
 ```
 
-**Key detail:** `indptr` must be shifted to local 0-based offsets before it is
-passed to `setValuesCSR`.
-
-> ⚠️ Every rank holds a full copy of the Jacobian, so per-rank memory does not
-> drop as more ranks are added. For very large cases, distribute the local
-> rows directly instead.
+`createAIJ(csr=...)` preallocates and inserts the local rows in one call
+(`MatMPIAIJSetPreallocationCSR`). **Key detail:** `indptr` must be shifted to
+local 0-based offsets. Ranks other than 0 never hold more than their own rows,
+so per-rank memory decreases with the number of ranks (rank 0 still needs the
+full matrix while reading).
 
 #### Mass matrix $\mathbf{B}$
 
@@ -932,10 +935,7 @@ $\mathbf{B}$ is diagonal. It is built from `samg.matrix.vol`, one volume per
 node, repeated `neq` times:
 
 ```python
-rstart, rend = B.getOwnershipRange()
-diag_vec = PETSc.Vec().createWithArray(bmatrix.data[rstart:rend], comm=comm)
-B.setDiagonal(diag_vec)
-B.assemble()
+B = assemble_diag(b_data, n)   # same row layout as A
 ```
 
 $\mathbf{B}$ enters the eigenvalue problem only when `gen = True`. It is
@@ -1060,9 +1060,7 @@ The checkpoint avoids recomputing across successive SLURM jobs:
    indices that continue from the highest existing `eigf_N.pval` /
    `eiga_N.pval`.
 
-> ⚠️ In `eig_solver.py` every rank calls `os.mkdir(output_path)` without
-> synchronisation, which can fail with `FileExistsError` when several ranks
-> race. `resolvent_solver.py` does it correctly (rank 0 + `Barrier`).
+The output directory is created by rank 0 only, followed by a barrier.
 
 ---
 
@@ -1078,13 +1076,15 @@ mpirun -n <N> python3 solver/resolvent_solver.py case_resolvent.floresparam
 [io]
 input_path   = JAC/
 output_path  = RESULTS_resolvent/
-coord_file   = samg.matrix.coo     # default
-# jac_file / vol_file are NOT read: always samg.matrix.amg.pval / samg.matrix.vol
+jac_file     = samg.matrix.amg.pval  # default
+vol_file     = samg.matrix.vol       # default
+coord_file   = samg.matrix.coo       # default
 
 [physics]
 mach    = 0.31
 beta    = 0.0
-nslices = 7          # only if beta != 0 (default 7)
+nslices = 7            # slices in the TAU Jacobian, only if beta != 0 (default 7)
+slice_spacing = 1.0    # spanwise distance between slices dy, only if beta != 0 (default 1.0)
 rlength = 1.0
 
 [frequencies]
@@ -1096,6 +1096,8 @@ omega_n     = 50     # np.linspace(start, end, n)
 nev                  = 5
 ncv                  = 20       # required (no default)
 shift                = 0.0      # real ST shift; 0 = none
+tol                  = 1e-6     # default
+max_it               = 1000     # default
 adjoint              = True
 compute_sensitivity  = True     # forces adjoint = True
 
@@ -1107,12 +1109,8 @@ zmin    = -5.0
 zmax    =  5.0
 ```
 
-The EPS tolerances are hard-coded: `tol = 1e-6`, `max_it = 1000`. They can be
-overridden from the command line (`-eps_tol`, `-eps_max_it`).
-
-> ⚠️ The comments in `test_cases/BFS/BFS_resolvent.floresparam` say that "SLEPc
-> will converge nev = 3*ncv". This is wrong: `ncv` is the dimension of the
-> Krylov subspace and must be at least `nev` (SLEPc recommends ≥ 2·`nev`).
+`ncv` is the dimension of the Krylov subspace and must be larger than `nev`
+(SLEPc recommends `ncv` ≥ 2·`nev`).
 
 ### 7.2 Direct resolvent: matrix-free shell operator
 
@@ -1138,17 +1136,15 @@ with Krylov–Schur (`NHEP`). For each converged pair $i$ (at most `nev`):
 - **optimal forcing** $\mathbf{P}\hat{\boldsymbol{f}}_i$ → `eigf_i_<omega>.pval`;
 - **optimal response** $L^{-1}\mathbf{P}\hat{\boldsymbol{f}}_i$ → `eigr_i_<omega>.pval`.
 
+The shell matrices have the size of the forcing space,
+$N_f = 2\,n/n_{eq}$ (the number of columns of $\mathbf{P}$), so any `neq`
+(laminar 4, RANS 5–6) is supported.
+
 > ⚠️ **Implementation notes:**
-> 1. The shell matrix is created with size `n//2`, while $\mathbf{P}$ has
->    $2n/n_{eq}$ columns. These match only for **`neq = 4`**, i.e. 2-D
->    laminar. With RANS (`neq = 5, 6`) or `beta ≠ 0` the size is wrong. Use
->    `2*n//neq`.
-> 2. $\mathbf{P}$ takes DOFs 1 and 2 of each node. With `beta ≠ 0` (order
+> 1. $\mathbf{P}$ takes DOFs 1 and 2 of each node. With `beta ≠ 0` (order
 >    `rho, u, v, w, e`) these are $u, v$, not the in-plane components.
-> 3. The `shift` parameter only sets the ST shift (type `shift` by default),
+> 2. The `shift` parameter only sets the ST shift (type `shift` by default),
 >    not a shift-invert.
-> 4. `resolvant.mult_transpose` is not used and is not correct as an
->    implementation of $\mathbf{D}^H$.
 
 ### 7.3 Adjoint resolvent
 
@@ -1208,13 +1204,18 @@ all `eigv_DIR_*j.dat` files in a directory and builds the curve.
 ### 7.6 Three-dimensional case (`beta ≠ 0`, partial)
 
 With `beta ≠ 0`, the resolvent assumes the TAU Jacobian contains `nslices`
-spanwise slices. It extracts the central slice and builds
-$\mathbf{A}_\beta = \mathbf{J}_0 + \mathbf{J}_{+1}e^{i\beta L_y} + \mathbf{J}_{-1}e^{-i\beta L_y}$.
+spanwise slices separated by `slice_spacing` $= \Delta y$. It takes the
+row block of the central slice $c$ = `nslices // 2` and, assuming
+$\hat{\boldsymbol{q}}_{c\pm1} = \hat{\boldsymbol{q}}_c\,e^{\pm i\beta\Delta y}$, builds
 
-> ⚠️ **Bug.** The code does
-> `j0 + j1*exp(1j*beta*Ly) - j1*exp(-1j*beta*Ly)`. `jm1` is never used, the
-> sign is wrong, and `Ly = 1` is hard-coded. Until this is fixed, the
-> resolvent results with `beta ≠ 0` are not valid.
+$$
+\mathbf{A}_\beta = \mathbf{J}_{c,c} + \mathbf{J}_{c,c+1}\,e^{i\beta\Delta y} + \mathbf{J}_{c,c-1}\,e^{-i\beta\Delta y}.
+$$
+
+> ⚠️ Still to be checked for `beta ≠ 0`: the length of `samg.matrix.vol`
+> (one volume per node of the whole multi-slice mesh, or of a single slice)
+> must match the size of $\mathbf{A}_\beta$, and the forcing components
+> (note 1 in [§7.2](#72-direct-resolvent-matrix-free-shell-operator)).
 
 ---
 
@@ -1285,9 +1286,6 @@ gain curve on a semi-log scale.
 - `--output` overrides the output file name.
 - Ticks: major every 1 and minor every 0.5 in $\omega$.
 
-> The docstring of the script still calls it `plot_gain_curve.py`. The file is
-> `plot_gain.py`.
-
 ---
 
 ## 9. SLURM Job Submission
@@ -1354,7 +1352,7 @@ Phases timed:
 | In-place PETSc/SLEPc build | Avoids `make install`; the source trees are used directly as `PETSC_DIR`/`SLEPC_DIR`. |
 | Complex PETSc (`--with-scalar-type=complex`) | Complex shifts and frequencies, complex modes. |
 | No `setType('seqaij')` | `seqaij` is incompatible with several MPI ranks; `setFromOptions()` selects `mpiaij`. |
-| `setValuesCSR` with local reindexing | Bulk insertion is much faster than row by row. |
+| Row distribution from rank 0 + `createAIJ(csr=...)` | Each rank receives and preallocates only its own rows; no replicated copies of the Jacobian. |
 | `comm.Bcast` instead of `comm.bcast` | Avoids pickling large sparse matrices. |
 | One LU per frequency (resolvent) / per shift (EVP) | Reused for `solve` and `solveTranspose` (adjoint) at no extra cost. |
 | Domain reduction by index slicing | Equivalent to $\mathbf{P}^T\mathbf{A}\mathbf{P}$ without building $\mathbf{P}$ or doing sparse products. |
@@ -1368,38 +1366,59 @@ Phases timed:
 
 ## 11. Known Discrepancies and Open Issues
 
-Review of branch `miguel_dev` (commit `64c5503`). Ordered by impact.
+Review of branch `miguel_dev`. Ordered by impact.
 
-### 11.1 Physics / numerics
+### 11.1 Open — physics / numerics
 
 | # | Location | Description | Suggestion |
 |---|---|---|---|
-| 1 | `resolvent_solver.py` (`beta ≠ 0`) | `j0 + j1·e^{iβ} − j1·e^{−iβ}`: `jm1` is never used, the sign is wrong, `Ly = 1` is hard-coded. | `j0 + j1·e^{iβLy} + jm1·e^{−iβLy}`, with `Ly` as a parameter. |
-| 2 | `resolvent_solver.py` | Shell size `n//2`; only correct for `neq = 4`. | `2*n//neq`. |
 | 3 | both solvers | Whether the Jacobian is divided by the volume depends on TAU's `Jacobian volume scaling (0/1)`, which FLORES cannot detect. The resolvent only supports `1`; the eigensolver relies on the user setting `gen` to match. Mismatches fail silently. | Add a `[physics] jacobian_volume_scaling = 0/1` key. If `0`, scale the rows of $\mathbf{A}$ by $\mathbf{M}^{-1}$ on read, so both solvers always work with $\mathbf{M}^{-1}\mathbf{J}$ and `gen` is no longer needed. |
 | 4 | `eig_solver.py` | Adjoint modes written as $\boldsymbol{p}$; with scaling `1` + `gen = False` the $\mathbf{M}$-adjoint is $\mathbf{M}^{-1}\boldsymbol{p}$. | Apply $\mathbf{M}^{-1}$ before writing `eiga_N.pval` (and before the sensitivity). |
 | 5 | `eig_solver.py` | Sensitivity per DOF, not per node (Frobenius norm). | Compute per node $\|q^+\|\|q\|$ (velocity) and write one scalar field. |
 | 6 | `eig_solver.py` | Normalisation $p^H\mathbf{B}q$ is correct only for scaling `0` + `gen = True`; with scaling `1` + `gen = False` it should be $p^Hq$. | Becomes automatic with the fix for #3 + #4 ($\hat q^+=\mathbf{M}^{-1}p$, $\langle\hat q^+,\mathbf{M}\hat q\rangle$). |
 | 7 | `eig_solver.py` | Direct/adjoint pairing after separate duplicate filtering. | Pair by EPS index before filtering. |
-| 8 | `resolvent_solver.py` | "Adjoint" operator $\mathbf{P}^T\mathbf{M}^{-1}L^{-1}\mathbf{Q}L^{-H}\mathbf{P}$ is not $\mathbf{R}\mathbf{R}^\dagger$. | Check that its eigenvalues match; redefine if needed. |
+| 8 | `resolvent_solver.py` | "Adjoint" operator $\mathbf{P}^T\mathbf{M}^{-1}L^{-1}\mathbf{Q}L^{-H}\mathbf{P}$ is not $\mathbf{R}\mathbf{R}^\dagger$. **Confirmed on a synthetic case:** at $\omega = 0.5$ the direct gains are 1.052, 0.667, 0.638 and the "adjoint" ones 1.651, 0.678, 0.619. | Redefine the adjoint operator (and the resolvent sensitivity that uses it). |
 | 9 | `resolvent_solver.py` | Energy norm $\mathbf{Q}=\mathbf{M}$ (not Chu). | Implement Chu (requires the base flow) or document it. |
 | 10 | `resolvent_solver.py` | $\mathbf{P}$ selects DOFs 1–2 (wrong for `beta ≠ 0`). | Choose the components according to `neq`/`beta`. |
 
-### 11.2 Robustness and usability
+### 11.2 Fixed
 
-| # | Location | Description |
-|---|---|---|
-| 11 | `eig_solver.py` | `os.mkdir(output_path)` on every rank (race condition). |
-| 12 | both solvers | The whole Jacobian is replicated on every rank (memory does not scale). |
-| 13 | `resolvent_solver.py` | Ignores `jac_file`/`vol_file`; EPS `tol`/`max_it` hard-coded. |
-| 14 | `eig_solver.py` | 3-D expansion with 21 hard-coded slices. |
-| 15 | `input_output.py` | Legacy Python 2 functions (`i/neq`, `size/2`). |
-| 16 | `save2pval.py` | `sens2pval` creates `rho` twice; `mode2pval3D` has duplicated unpacking code; `mode2pval` writes `global_id = arange` instead of the TAU one. |
-| 17 | `resolvent_solver.py` | `resolvant.mult_transpose` is incorrect (not used). |
-| 18 | repo | `solver/__pycache__/*.pyc` committed. |
-| 19 | docstrings / README | References to `eig_simple.py`, `EIGENSOLVER.py`, `RESOLVANT.py`, `eig.py`, `resolvent.py`, `plot_gain_curve.py`. |
-| 20 | `test_cases/` | Absolute CESVIMA paths; incorrect `nev`/`ncv` comment; `load_env_*.sh` not included. |
-| 21 | `miguel_dev` vs `main` | `main` has `Cylinder_Re45` and a more recent README not yet merged into this branch. |
+| # | Location | Problem | Fix |
+|---|---|---|---|
+| 1 | `resolvent_solver.py` | `beta ≠ 0`: `j0 + j1·e^{iβ} − j1·e^{−iβ}` (`jm1` unused, wrong sign, `Ly = 1`). | `j0 + j1·e^{iβΔy} + jm1·e^{−iβΔy}`, central slice `nslices//2`, `Δy` = `[physics] slice_spacing`. |
+| 2 | `resolvent_solver.py` | Shell size `n//2`, only valid for `neq = 4`. | Size of the forcing space, `2*(n//neq)`. |
+| 11 | `eig_solver.py` | `os.mkdir(output_path)` on every rank. | Rank 0 + `Barrier`. |
+| 12 | both solvers | Whole Jacobian replicated on every rank. | `mpi_utils.py`: rank 0 sends each rank only its rows. |
+| 13 | `resolvent_solver.py` | Ignored `jac_file`/`vol_file`; EPS `tol`/`max_it` hard-coded. | Read from `[io]` / `[solver]` (defaults unchanged). |
+| 14 | `eig_solver.py` | 3-D expansion with 21 hard-coded slices. | `[physics] output_slices` (default 21). |
+| 15 | `input_output.py` | Legacy readers with Python 2 semantics. | Ported to Python 3 (vectorised). |
+| 16 | `save2pval.py` | `sens2pval` crashed with `dreduced=True` (variable `rho` created twice); duplicated unpacking in `mode2pval3D`. | Rewritten; `mode2pval3D` output unchanged. `global_id` is still `arange` (TAU ids not available in the Jacobian file). |
+| 17 | `resolvent_solver.py` | Incorrect, unused `resolvant.mult_transpose`. | Removed. |
+| 18 | repo | `__pycache__/*.pyc` committed. | Removed; `.gitignore` added. |
+| 19 | docstrings / README | Old script names. | Updated. |
+| 20 | `test_cases/` | Absolute CESVIMA paths; wrong `nev`/`ncv` comment; environment script executed instead of sourced. | `${FLORES_DIR}` / `./JAC/`; comments fixed; `source`. |
+| 21 | `miguel_dev` vs `main` | `Cylinder_Re45` and newer README only on `main`. | `main` merged into `miguel_dev`. |
+| 22 | both solvers | `Mat.getVecs()` was removed in petsc4py 3.26 (crash; with several ranks the other ranks hung). | `Mat.createVecs()` (available in 3.25 too). |
+| 23 | `resolvent_solver.py` | `pcreate` passed int64 row pointers to `setPreallocationCSR`, which fails with 32-bit PETSc indices; full $\mathbf{P}$ built on every rank with Python loops. | Each rank builds its own rows of $\mathbf{P}$ (vectorised). |
+
+### 11.3 Validation of the fixes
+
+The changes were checked on synthetic TAU-format Jacobians (72 grid points,
+`neq = 4` and `neq = 6`, with and without domain reduction), with 1 and 3 MPI
+ranks, PETSc/SLEPc 3.26 (complex) and MUMPS:
+
+- eigenvalues (direct and adjoint) agree with a dense SciPy reference to
+  < 1e-8, and the resolvent gains (direct and "adjoint" operators) to
+  < 1e-5 relative;
+- eigenvalues, gains and all `.pval` files (modes up to a complex phase,
+  sensitivities exactly) are identical to the previous version of the code
+  wherever that version runs;
+- the resolvent with `neq = 6` failed in the previous version (PETSc error
+  60, nonconforming sizes) and now matches the dense reference;
+- the `beta ≠ 0` reduction was checked separately against a 7-slice
+  block-tridiagonal operator (error 1e-15; the previous formula gave an error
+  of order 10).
+
 
 ---
 
@@ -1431,9 +1450,9 @@ Review of branch `miguel_dev` (commit `64c5503`). Ordered by impact.
 | Parameters | Hard-coded in the script | `.floresparam` (INI) file via CLI |
 | Checkpoint | None | Load / skip / append (eigenvalues only) |
 | MPI broadcast | `comm.bcast` (pickle) | `comm.Bcast` (buffers) |
-| Matrix assembly | `setPreallocationCSR` + `xrange` loops | `setValuesCSR` with CSR slicing (eig, resolvent `make_petsc_mat`); `setPreallocationCSR` is still used for $\mathbf{P}$ |
+| Matrix assembly | `setPreallocationCSR` + `xrange` loops | Rows sent from rank 0 to their owner, `createAIJ(csr=...)` (`mpi_utils.py`) |
 | Timing | None | Per-phase `_t()` helper |
 | Python | Python 2 (`xrange`, `print`) | Python 3 (legacy functions remain in `input_output.py`) |
 | MUMPS options | Basic (`icntl_10`, `icntl_11`) | No `ICNTL` set in code; configurable at runtime with `-mat_mumps_icntl_*` |
 | Adjoint | Separate solve with $\mathbf{A}^H$ | Two-sided EPS (eig) / shell reusing the LU (resolvent) |
-| Multi-slice ($\beta\neq 0$) | Supported | Eig: 3-D output only. Resolvent: partial support with a bug (§7.6) |
+| Multi-slice ($\beta\neq 0$) | Supported | Eig: 3-D output only. Resolvent: central-slice Fourier reduction (§7.6), partially validated |
