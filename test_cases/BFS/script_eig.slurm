@@ -27,10 +27,13 @@ export MKL_NUM_THREADS=1                         # desactivado
 export NUMEXPR_NUM_THREADS=1                     # desactivado
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SOLVER_PATH=/home/w059/w059589/apps/FLORES/solver
+# Path to the FLORES repository (override with: export FLORES_DIR=...)
+SOLVER_PATH=${FLORES_DIR:-/path/to/FLORES}/solver
 INI_FILE=BFS_eig.floresparam
 
 # ── Environment ───────────────────────────────────────────────────────────────
+# Site-specific script that loads modules and activates the Python venv
+# (not included in the repository, see doc/ chapter 3)
 source load_env_STAB_tool_ompi.sh
 
 # ── Create LOG directory if it does not exist ─────────────────────────────────

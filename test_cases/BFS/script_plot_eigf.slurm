@@ -23,6 +23,9 @@ export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-./load_env_STAB_tool.sh
+# Site-specific script that loads modules and activates the Python venv
+# (must be sourced, not executed, so the environment persists)
+source load_env_STAB_tool.sh
 
-python3 plot_pval_eigfunction.py --dir eig_results/ --mode 1 64 
+TOOLS_PATH=${FLORES_DIR:-/path/to/FLORES}/tools
+python3 ${TOOLS_PATH}/plot_pval_eigfunction.py --dir eig_results/ --mode 1 64 

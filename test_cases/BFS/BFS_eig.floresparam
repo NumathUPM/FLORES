@@ -1,12 +1,12 @@
 # ============================================================
 #  EIGENSOLVER control file
-#  Usage:  python EIGENSOLVER.py eigensolver.ini
-#          mpirun -n 4 python EIGENSOLVER.py eigensolver.ini
+#  Usage:  python eig_solver.py BFS_eig.floresparam
+#          mpirun -n 4 python eig_solver.py BFS_eig.floresparam
 # ============================================================
 
 [io]
 # Directory containing the Jacobian, volumes and coordinates files
-input_path  = /home/w059/w059589/projects/07_TRANSDIFFUSE/03_Bump/JAC/
+input_path  = ./JAC/
 
 # Directory where eigenvalues (.dat) and eigenvectors (.pval) will be written
 # Created automatically if it does not exist
