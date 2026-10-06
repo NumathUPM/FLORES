@@ -2,7 +2,6 @@
 
 from netCDF4 import Dataset
 import numpy as np
-import h5py
 from scipy.sparse import csr_matrix, csc_matrix
 import sys,os
 
@@ -38,107 +37,128 @@ def openjacobian(jacfile):
     mjac.eliminate_zeros()
     return mjac, neq
 
-def open_sod2d_jacobian(input_path,jacfile):
-    # read from SOD2D's WIP hdf format
+def _import_h5py():
+    """h5py is only needed for SOD2D input; import it lazily so that TAU
+    users do not need it installed."""
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError('Reading SOD2D files requires h5py '
+                          '(pip install h5py)')
+    return h5py
+
+
+def _sod2d_neq(n, numpoints):
+    """Number of equations = degrees of freedom / number of nodes."""
+    if numpoints == 0 or n % numpoints != 0:
+        raise ValueError('SOD2D Jacobian size ({0}) is not a multiple of the '
+                         'number of nodes ({1})'.format(n, numpoints))
+    return n // numpoints
+
+
+def _natural_key(path):
+    """Sort key that orders 'file_2.hdf' before 'file_10.hdf'."""
+    import re
+    return [int(t) if t.isdigit() else t
+            for t in re.split(r'(\d+)', os.path.basename(path))]
+
+
+def open_sod2d_jacobian(input_path, jacfile):
+    """
+    Read a SOD2D Jacobian (WIP HDF5 format) and return it as CSR.
+
+    Datasets: col_ptr, row_ind, values (CSC, 0-based) and node_coords.
+    If input_path contains more than one .hdf file, they are read as a
+    "split parallel" Jacobian (see open_split_sod2d_jacobian).
+    """
+    h5py = _import_h5py()
 
     hdfs_in_path = [x for x in os.listdir(input_path) if x.endswith(".hdf")]
-    if len(hdfs_in_path)>1:
+    if len(hdfs_in_path) > 1:
         print(" Detected multiple SOD2D hdfs, reading as split Jacobian...")
         return open_split_sod2d_jacobian(input_path)
+    if not os.path.isfile(jacfile) and len(hdfs_in_path) == 1:
+        jacfile = os.path.join(input_path, hdfs_in_path[0])
 
-    f = h5py.File(jacfile,'r')
+    with h5py.File(jacfile, 'r') as f:
+        col_ptr = np.array(f['col_ptr'][:], dtype=np.int32)
+        row_ind = np.array(f['row_ind'][:], dtype=np.int32)
+        values  = np.array(f['values'][:],  dtype=np.float64)
+        numpoints = f['node_coords'].shape[0]
 
-    col_ptr = np.array(f['col_ptr'][:],dtype=np.int32)
-    row_ind = np.array(f['row_ind'][:],dtype=np.int32)
-    values = np.array(f['values'][:],dtype=np.float64)
-    coords = np.array(f['node_coords'][:],dtype=np.float64)
+    n   = len(col_ptr) - 1
+    neq = _sod2d_neq(n, numpoints)
 
-    n = len(col_ptr)-1
-    numpoints = np.shape(coords)[0]
-
-    neq = n/numpoints # number of eqs = number of degrees of freedom / number of nodes
-
-    mjac = csc_matrix((values,row_ind,col_ptr))
+    mjac = csc_matrix((values, row_ind, col_ptr), shape=(n, n))
     mjac = mjac.tocsr()
     mjac.eliminate_zeros()
 
     return mjac, neq
 
-def open_split_sod2d_jacobian(input_path):
-    # read from SOD2D's WIP hdf format
-    # uses the "split parallel" format where multiple hdfs each contain part of a single matrix
 
-    # sorts files in lexicographical order
-    # for less than 10 procs, if filenames remain unchanged 
-    # from their output in SOD2D, this will ensure
-    # matrix cols are added in correct order
-    sorted_files = sorted([os.path.join(input_path, single_file) for single_file in os.listdir(input_path)])
+def open_split_sod2d_jacobian(input_path):
+    """
+    Read a SOD2D Jacobian written in the "split parallel" format, where
+    each .hdf file in input_path holds a block of consecutive columns
+    (one file per SOD2D rank). Files are concatenated in natural order of
+    their names (rank number), zeros in each col_ptr are discarded.
+    """
+    h5py = _import_h5py()
+
+    sorted_files = sorted([os.path.join(input_path, x)
+                           for x in os.listdir(input_path)
+                           if x.endswith(".hdf")], key=_natural_key)
 
     nnz = 0
     num_cols = 0
     for jacfile in sorted_files:
-    
-        f = h5py.File(jacfile,'r')
-        col_ptr_with_zeros = np.array(f['col_ptr'],dtype=np.int32)
-        vals = np.array(f['values'],dtype=np.int32)
+        with h5py.File(jacfile, 'r') as f:
+            col_ptr_with_zeros = np.array(f['col_ptr'], dtype=np.int32)
+            nnz += f['values'].shape[0]
+        num_cols += len(filter_col_ptr(col_ptr_with_zeros))
 
-        filtered_col_ptr = filter_col_ptr(col_ptr_with_zeros)
-        nnz += len(vals)
-        num_cols += len(filtered_col_ptr) # TODO might fail
-        f.close()
-
-    col_ptr = np.zeros(num_cols+1,dtype=np.int32)
-    row_ind = np.zeros(int(nnz),dtype=np.int32)
-    values = np.zeros(int(nnz),dtype=np.float64)
-    coords = np.zeros((num_cols//5,3),dtype=np.float64) # TODO might be wrong
+    col_ptr = np.zeros(num_cols + 1, dtype=np.int32)
+    row_ind = np.zeros(int(nnz),     dtype=np.int32)
+    values  = np.zeros(int(nnz),     dtype=np.float64)
 
     previous_col = 0
-    current_col = 0
     previous_nnz = 0
-    current_nnz = 0
-
-    got_coords = False
-    indice = 1
+    numpoints = None
     for jacfile in sorted_files:
-    
-        f = h5py.File(jacfile,'r')
+        with h5py.File(jacfile, 'r') as f:
+            current_col_ptr_with_zeros = np.array(f['col_ptr'], dtype=np.int32)
+            current_filtered_col_ptr = filter_col_ptr(current_col_ptr_with_zeros)
 
-        current_col_ptr_with_zeros = np.array(f['col_ptr'],dtype=np.int32)
-        current_filtered_col_ptr = filter_col_ptr(current_col_ptr_with_zeros)
+            current_nnz = previous_nnz + current_filtered_col_ptr[-1]
+            current_col = previous_col + len(current_filtered_col_ptr)
+            col_ptr[previous_col+1:current_col+1] = previous_nnz + current_filtered_col_ptr
+            row_ind[previous_nnz:current_nnz] = f['row_ind'][:]
+            values[previous_nnz:current_nnz]  = f['values'][:]
+            # node coords are currently the same in every file of the split
+            if numpoints is None:
+                numpoints = f['node_coords'].shape[0]
 
-        current_nnz = previous_nnz + current_filtered_col_ptr[-1]
-        current_col = previous_col + len(current_filtered_col_ptr)
-        col_ptr[previous_col+1:current_col+1] = previous_nnz + current_filtered_col_ptr
-        row_ind[previous_nnz:current_nnz] = f['row_ind'][:]
-        values[previous_nnz:current_nnz] = f['values'][:]
-        # the node coords are currently output the same across all files of the "split"; only need reading once
-        if(not got_coords):
-            got_coords = True
-            coords = np.array(f['node_coords'][:],dtype=np.float64)
-
-        f.close()
         previous_col = current_col
         previous_nnz = current_nnz
-        indice += 1
 
-    print(f"Got a nnz total of {col_ptr[-1]} which should match size of row_ind, which is {len(row_ind)}")
-    
+    print(" Got a nnz total of {0} which should match size of row_ind, "
+          "which is {1}".format(col_ptr[-1], len(row_ind)))
 
-    n = len(col_ptr)-1
-    numpoints = np.shape(coords)[0]
+    n   = len(col_ptr) - 1
+    neq = _sod2d_neq(n, numpoints)
 
-    neq = n/numpoints # number of eqs = number of degrees of freedom / number of nodes
-
-    mjac = csc_matrix((values,row_ind,col_ptr))
+    mjac = csc_matrix((values, row_ind, col_ptr), shape=(n, n))
     mjac = mjac.tocsr()
     mjac.eliminate_zeros()
 
     return mjac, neq
 
+
 def filter_col_ptr(initial_col_ptr):
-    
-    filtered_col_ptr = initial_col_ptr[initial_col_ptr != 0]
-    return filtered_col_ptr
+    """Drop the zero entries of a per-file col_ptr (columns not stored
+    in that file, and the leading 0)."""
+    return initial_col_ptr[initial_col_ptr != 0]
+
 # -------------------------------------------------------------------- #
 
 def openqe(jacfile):
@@ -259,22 +279,20 @@ def read_coordinates(coordfile, rlength, beta):
 
     return new_data
 
-def read_sod2d_coordinates(coordfile, rlength, beta):
-    """Read coordinates from sod2d hdf5 file.
-
-    Uses h5py to read the coordinates from SOD2D.
+def read_sod2d_coordinates(coordfile, rlength, beta, neq=5):
     """
+    Read node coordinates from a SOD2D HDF5 file (dataset node_coords)
+    and repeat each row neq times, so that there is one row per DOF as in
+    the TAU .coo file. Columns: x, y, z.
+    """
+    h5py = _import_h5py()
     print(' READING COORDINATES FROM SOD2D OUTPUT FILE: ', coordfile)
 
-    f = h5py.File(coordfile,'r')
-    coords = np.array(f['node_coords'][:],dtype=np.float64)
+    with h5py.File(coordfile, 'r') as f:
+        coords = np.array(f['node_coords'][:], dtype=np.float64)
     coords *= rlength
 
-    neq = 5
-
-    new_data = np.repeat(coords, neq, axis=0)   # shape (gridpoints*(neq+1), ndim)
-
-    return new_data
+    return np.repeat(coords, neq, axis=0)     # shape (gridpoints*neq, ndim)
 
 def dump_sod2d_coordinates(filename: str, coords: np.ndarray, neq: int, kept_idx = None):
     """
