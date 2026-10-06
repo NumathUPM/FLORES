@@ -50,6 +50,11 @@ def read_control_file(filepath):
             jac_file        : Jacobian filename   (default: samg.matrix.amg.pval)
             vol_file        : volumes filename    (default: samg.matrix.vol)
             coord_file      : coordinates filename (default: samg.matrix.coo)
+            simulator       : origin of the Jacobian, 'tau' or 'sod2d'
+                              (default: tau)
+            sod2d_dumpfile  : SOD2D only: name of the .coo file written in
+                              output_path with the (kept) node coordinates
+                              (default: samg.matrix.coo)
 
         [physics]
             mach            : Mach number
@@ -100,7 +105,10 @@ def read_control_file(filepath):
     p['vol_file']    = cfg.get('io', 'vol_file',   fallback='samg.matrix.vol').strip()
     p['coord_file']  = cfg.get('io', 'coord_file', fallback='samg.matrix.coo').strip()
     p['sod2d_dumpfile'] = cfg.get('io', 'sod2d_dumpfile', fallback='samg.matrix.coo').strip()
-    p['simulator']   = cfg.get('io', 'simulator', fallback='tau').strip()
+    p['simulator']   = cfg.get('io', 'simulator', fallback='tau').replace(' ', '').lower()
+    if p['simulator'] not in ('tau', 'sod2d'):
+        raise ValueError("[io] simulator must be 'tau' or 'sod2d', got "
+                         "'{0}'".format(p['simulator']))
 
     # [physics]
     p['mach']    = cfg.getfloat('physics', 'mach')
@@ -276,7 +284,8 @@ def solve_eigenproblem(A, B, nev, ncv, the_shift, tol, max_it, gen,
 
 def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
                                    nvars, n, neq, beta, dreduced, rgid,
-                                   output_path, rank, output_slices=21):
+                                   output_path, rank, output_slices=21,
+                                   is_simulator_sod2d=False):
     """
     Compute and save the structural sensitivity for each mode pair.
 
@@ -351,7 +360,8 @@ def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
 
             outfile = os.path.join(output_path,
                                    'sensitivity_{0}.pval'.format(i))
-            mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid)
+            mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid,
+                      is_simulator_sod2d)
             if beta != 0:
                 mode2pval3D(outfile, sens_pvec, nvars, n, neq, beta, output_slices,
                             dreduced, rgid)
@@ -401,7 +411,7 @@ def run_slices(params):
     dup_tol_real = params['dup_tol_real']
     dup_tol_imag = params['dup_tol_imag']
 
-    is_simulator_sod2d = (simulator.replace(" ","") == 'sod2d')
+    is_simulator_sod2d = (simulator == 'sod2d')
 
     # Sensitivity requires both direct and adjoint modes
     if sensitivity and not adjoint:
@@ -431,7 +441,7 @@ def run_slices(params):
     Print(' ========================================')
     Print(' Input path  : {0}'.format(input_path))
     Print(' Output path : {0}'.format(output_path))
-    Print(' Jacobian    : {0}'.format(jacfile))
+    Print(' Jacobian    : {0}  ({1})'.format(jacfile, simulator))
     Print(' Mach        : {0}'.format(mach))
     Print(' beta        : {0}'.format(beta))
     Print(' Shift       : {0}'.format(the_shift))
@@ -498,27 +508,23 @@ def run_slices(params):
     t0 = time.time()
     Print(' Reading mass matrix and generating M')
     Print('')
-    if rank == 0:
-        if(is_simulator_sod2d):
-            vols_buf = np.repeat(1,nvars).astype(np.float64)
-        else:
-            with open(volfile, 'r') as f:
-                vols_buf = np.array([float(line) for line in f.readlines()],
-                                    dtype=np.float64)
-        ngp = np.array([len(vols_buf)], dtype=np.int64)
-    else:
-        ngp = np.empty(1, dtype=np.int64)
-
-    comm.Bcast(ngp, root=0)
-    if rank != 0:
-        vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
-    comm.Bcast(vols_buf, root=0)
-
     if is_simulator_sod2d:
         # SOD2D: no cell volumes are exported, the mass matrix is the identity
         # TODO had a 0.01 multiplying identity mat here - find out why
         b_data = np.ones(nvars, dtype=np.complex128)
     else:
+        if rank == 0:
+            with open(volfile, 'r') as f:
+                vols_buf = np.array([float(line) for line in f.readlines()],
+                                    dtype=np.float64)
+            ngp = np.array([len(vols_buf)], dtype=np.int64)
+        else:
+            ngp = np.empty(1, dtype=np.int64)
+
+        comm.Bcast(ngp, root=0)
+        if rank != 0:
+            vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
+        comm.Bcast(vols_buf, root=0)
         b_data = np.repeat(vols_buf, neq).astype(np.complex128)   # diag(M)
     _t(comm, rank, 'Mass matrix build', t0)
 
@@ -531,7 +537,7 @@ def run_slices(params):
 
         if rank == 0:
             if(is_simulator_sod2d):
-                coord = read_sod2d_coordinates(coofile, rlength, beta)
+                coord = read_sod2d_coordinates(coofile, rlength, beta, neq)
             else:
                 coord = read_coordinates(coofile, rlength, beta)
             dr = domain_reduction(zmin, zmax, xmin, xmax)
@@ -564,19 +570,16 @@ def run_slices(params):
 
         n    = n_red
         rgid = rgid.astype(int)
-        # ────── Dump coords to .coo if using SOD2D ───────────────────────────────
+        # ── SOD2D: dump the kept coordinates to a TAU-like .coo file ──────
         if(is_simulator_sod2d and rank==0):
-            coord = read_sod2d_coordinates(coofile, rlength, beta)
-            dump_sod2d_coordinates(sod2d_dumpfile, coord, 5, dr.kept_idx)
+            dump_sod2d_coordinates(sod2d_dumpfile, coord, neq, dr.kept_idx)
     else:
         rgid = None
         n    = nvars
         if(is_simulator_sod2d and rank==0):
-            coord = read_sod2d_coordinates(coofile, rlength, beta)
-            dump_sod2d_coordinates(sod2d_dumpfile, coord, 5)
+            coord = read_sod2d_coordinates(coofile, rlength, beta, neq)
+            dump_sod2d_coordinates(sod2d_dumpfile, coord, neq)
     _t(comm, rank, 'Domain reduction', t0)
-
-
 
     # ── Assemble PETSc matrices ──────────────────────────────────────────────
     # Rank 0 sends each rank only the rows it owns (no full-matrix copies).
@@ -653,7 +656,8 @@ def run_slices(params):
             scatter, eigenvec = PETSc.Scatter.toZero(xr)
             scatter.scatter(xr, eigenvec, False, PETSc.Scatter.Mode.FORWARD)
             if rank == 0:
-                mode2pval(eigvecfile, eigenvec, nvars, n, neq, beta, dreduced, rgid, is_simulator_sod2d)
+                mode2pval(eigvecfile, eigenvec, nvars, n, neq, beta, dreduced, rgid,
+                          is_simulator_sod2d)
                 if beta != 0:
                     mode2pval3D(eigvecfile, eigenvec, nvars, n, neq, beta, output_slices,
                                 dreduced, rgid)
@@ -742,7 +746,8 @@ def run_slices(params):
                 scatter_a, adjvec = PETSc.Scatter.toZero(yr)
                 scatter_a.scatter(yr, adjvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
-                    mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid)
+                    mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid,
+                              is_simulator_sod2d)
                     if beta != 0:
                         mode2pval3D(adjvecfile, adjvec, nvars, n, neq, beta, output_slices,
                                     dreduced, rgid)
@@ -782,7 +787,7 @@ def run_slices(params):
             compute_structural_sensitivity(
                 dir_vecs_kept, adj_vecs_kept, B,
                 nvars, n, neq, beta, dreduced, rgid,
-                output_path, rank, output_slices)
+                output_path, rank, output_slices, is_simulator_sod2d)
             _t(comm, rank, 'Structural sensitivity', t0)
         elif sensitivity:
             Print(' WARNING: no mode pairs available for sensitivity computation.')
