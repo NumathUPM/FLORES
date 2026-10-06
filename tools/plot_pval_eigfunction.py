@@ -106,7 +106,7 @@ VAR_MAP = {
     'u':     ('u',     'u_i'),
     'w':     ('w',     'w_i'),
     'e':     ('e',     'e_i'),
-    'v':     ('v',     None),
+    'v':     ('v',     'v_i'),
     'turb1': ('turb1', 'turb1_i'),
     'turb2': ('turb2', 'turb2_i'),
 }
@@ -909,9 +909,9 @@ def tris_info(triang):
 
 def print_usage_and_exit(error_msg=None):
     """Print a concise usage guide and exit."""
+    print(__doc__)
     if error_msg:
         print(f"\n  ERROR: {error_msg}\n", file=sys.stderr)
-    print(__doc__)
     sys.exit(1 if error_msg else 0)
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -991,7 +991,10 @@ def main():
     # Show help / usage when requested or when called with no arguments
     if args.help or (not args.pval and not args.modes
                      and not args.check_mesh):
-        print_usage_and_exit()
+        if(args.help):
+            print_usage_and_exit()
+        else:
+            print_usage_and_exit(f"You must specify at least one of pval, modes, check_mesh. Values are:\n pval:{args.pval} modes:{args.modes} check_mesh:{args.check_mesh}")
 
     # ── 1. coordinates ─────────────────────────────────────────────────────────
     print(f"\n── Loading coordinates ─────────────────────────────────────────")

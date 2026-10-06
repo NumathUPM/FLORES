@@ -2,11 +2,29 @@
 __pycache__/
 *.py[cod]
 
-# Python environments created by python_env_installation/
+# Build files and Python environments created by python_env_installation/
+python_env_installation/*
+!python_env_installation/Cesvima_UPM_Installation_ompi.sh
+!python_env_installation/Cesvima_UPM_Installation.sh
+!python_env_installation/Ubuntu_Installation.sh
 myvenv/
 myvenv_ompi/
 flores_env/
 
-# Run outputs
+# Files generated when running test cases or plotting.
+# Everything under test_cases/ is ignored except the case definitions
+# (control files and job scripts) in each case folder.
+test_cases/**/*
+!test_cases/**/
+!test_cases/**/*.floresparam
+!test_cases/**/*.slurm
 LOG/
 RESULTS_*/
+*.dat
+*.png
+*.pval
+*.coo
+tools/*.sh
+
+# Misc.
+to-ignore/*
