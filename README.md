@@ -108,6 +108,7 @@ Create a control file (e.g. `case_eig.floresparam`):
 
 ```ini
 [io]
+simulator    = tau          # source of the Jacobian: tau (default) or sod2d
 input_path   = JAC/
 output_path  = RESULTS_eig/
 jac_file     = samg.matrix.amg.pval
@@ -162,6 +163,16 @@ sensitivity field for each mode pair is written to
 `RESULTS_eig/sensitivity_N.pval`. Duplicate detection across restarts
 is built in: previously converged eigenvalues are loaded on startup and
 skipped automatically.
+
+#### SOD2D Jacobians
+
+The eigenvalue solver can also read Jacobians exported by SOD2D (HDF5,
+`h5py` required). Set `simulator = sod2d` in `[io]`, point `jac_file` and
+`coord_file` to the `.hdf` file (with several `.hdf` files in `input_path`
+the Jacobian is read in the split parallel format). The mass matrix is the
+identity, and the node coordinates are written to
+`RESULTS_eig/samg.matrix.coo` for post-processing. See chapter 2.4 of the
+[technical documentation](doc/FLORES_Technical_Documentation.md).
 
 ---
 
@@ -231,7 +242,7 @@ resolvent structural sensitivity is written to
 
 Domain reduction can be enabled in either solver to restrict the
 eigenvalue or resolvent problem to a physically relevant subdomain
-$\Omega_m \subset \Omega_n$, reducing memory and computational cost. Set `enabled = True` in `[domain_reduction]`
+$`\Omega_m \subset \Omega_n`$, reducing memory and computational cost. Set `enabled = True` in `[domain_reduction]`
 and specify the bounding box. The subdomain should contain the region
 of high structural sensitivity of the dominant mode.
 

@@ -64,10 +64,15 @@ The toolkit performs two complementary analyses:
    the associated gain curves $`\lambda_1^2(\omega)`$, characterising
    pseudo-resonances and amplification mechanisms.
 
-Both analyses use numerical Jacobian matrices produced by the **DLR TAU
-Code**. These are read from `samg.matrix.amg.pval` (SAMG/NetCDF format),
-together with the cell volumes (`samg.matrix.vol`) and the DOF coordinates
-(`samg.matrix.coo`).
+Both analyses use numerical Jacobian matrices produced by an external CFD
+solver:
+
+- the **DLR TAU Code** (default): `samg.matrix.amg.pval` (SAMG/NetCDF
+  format), together with the cell volumes (`samg.matrix.vol`) and the DOF
+  coordinates (`samg.matrix.coo`);
+- **SOD2D** (eigenvalue solver only): HDF5 files with the Jacobian and the
+  node coordinates, in a single file or split into one file per SOD2D rank
+  (see [§2.4](#24-jacobian-sources-tau-and-sod2d)).
 
 ### 1.2 Mathematical Background
 
@@ -482,6 +487,7 @@ from the structural sensitivity (13) of the eigenvalue problem.
 | NumPy | Numerical arrays | any |
 | SciPy | Sparse matrices (CSR) on rank 0 | any |
 | netCDF4 | Reads TAU Jacobian, writes `.pval` | any |
+| h5py | Reads SOD2D Jacobians (HDF5); only needed with `simulator = sod2d` | any |
 | matplotlib | Post-processing (`tools/`) | any |
 | OpenMPI | MPI implementation (cluster) | 4.1.1 |
 
@@ -528,6 +534,8 @@ now `solver/eig_solver.py`, `solver/resolvent_solver.py` and `tools/`.
 | `samg.matrix.vol` | Cell volumes, one per line (one per node) |
 | `samg.matrix.coo` | Header `ndof ndim`, then one `x z` row per DOF (`neq` identical rows per node) |
 
+For SOD2D input files see [§2.4](#24-jacobian-sources-tau-and-sod2d).
+
 **Control files** are INI files with the extension `.floresparam`, passed as
 the first command-line argument.
 
@@ -553,6 +561,7 @@ Supports three modes, controlled by the control file:
 Shared features:
 
 - configuration through a `.floresparam`/`.ini` file;
+- Jacobians from TAU or SOD2D (`[io] simulator`, [§2.4](#24-jacobian-sources-tau-and-sod2d));
 - **checkpoint/resume** with duplicate detection
   ([§6.6](#66-checkpoint-and-resume));
 - consecutive numbering of eigenvector files across runs;
@@ -594,6 +603,122 @@ Implements the resolvent as a **matrix-free shell operator** in PETSc/SLEPc:
 > `mode2pval()` writes `global_id = 0 … 2·gridpoints−1`, not the TAU
 > `global_id`. The Jacobian file does not contain the TAU ids, so this assumes
 > the TAU point ordering is the natural one.
+
+`input_output.py` also contains the SOD2D readers: `open_sod2d_jacobian()`,
+`open_split_sod2d_jacobian()`, `read_sod2d_coordinates()` and
+`dump_sod2d_coordinates()` (see [§2.4](#24-jacobian-sources-tau-and-sod2d)).
+
+### 2.4 Jacobian sources: TAU and SOD2D
+
+The origin of the Jacobian is selected in the control file:
+
+```ini
+[io]
+simulator = tau      # default; or: sod2d
+```
+
+The value is case-insensitive. **Only `eig_solver.py` reads this key**; the
+resolvent solver always expects TAU files.
+
+#### 2.4.1 Differences between the two sources
+
+| | TAU (`simulator = tau`) | SOD2D (`simulator = sod2d`) |
+|---|---|---|
+| Jacobian file | `jac_file` (NetCDF, CSR, 1-based) | `jac_file` (HDF5, CSC, 0-based), or several `.hdf` files in `input_path` |
+| Reader | `openjacobian()` | `open_sod2d_jacobian()` / `open_split_sod2d_jacobian()` |
+| `neq` | read from the file (`neq` dimension) | DOFs / number of nodes (5 in practice) |
+| Mass matrix $`\mathbf{M}`$ | cell volumes from `vol_file` | **identity** (no volumes are exported) |
+| Coordinates | `coord_file` (`.coo` text file, one row per DOF) | `coord_file` = an HDF5 file with `node_coords` (one row per node, columns $`x, y, z`$) |
+| Variables in `.pval` | `rho, u, w, e[, turb1, turb2]` | `rho, u, v, w, e` |
+| `.coo` for post-processing | the TAU one | written by FLORES to `output_path/sod2d_dumpfile` |
+| Resolvent | supported | **not supported** |
+
+The Mach scaling $`1/(M_\infty\sqrt{\gamma})`$ is applied to both.
+
+#### 2.4.2 SOD2D file format (work in progress in SOD2D)
+
+Each HDF5 file contains the datasets:
+
+| Dataset | Content |
+|---|---|
+| `col_ptr` | Column pointers of the Jacobian in CSC format (0-based), length $`N_\mathrm{DOF}+1`$ |
+| `row_ind` | Row index of each non-zero |
+| `values` | Value of each non-zero |
+| `node_coords` | Node coordinates, shape $`(N_\mathrm{nodes}, 3)`$ |
+
+The number of equations is $`n_{eq} = N_\mathrm{DOF}/N_\mathrm{nodes}`$; the reader
+stops with an error if it is not an integer.
+
+**Single file.** If `input_path` contains a single `.hdf` file, it is read
+directly (if `jac_file` does not exist, that single file is used).
+
+**Split parallel format.** If `input_path` contains **more than one** `.hdf`
+file, they are read as one Jacobian split by columns, one file per SOD2D rank:
+
+- every file has a `col_ptr` of full length in which only the columns stored in
+  that file are non-zero (local cumulative counts); the zeros are discarded;
+- the column blocks are concatenated in the **natural order of the file names**
+  (`jacobian_2.hdf` before `jacobian_10.hdf`), which must be the rank order;
+- `node_coords` is the same in every file and is read once.
+
+> ⚠️ `input_path` must contain only the `.hdf` files of one Jacobian. A
+> column with no non-zeros at the start of a file would be dropped together
+> with the zeros of `col_ptr`; the reader checks that the total number of
+> columns is a multiple of the number of nodes.
+
+#### 2.4.3 Control file
+
+```ini
+[io]
+simulator      = sod2d
+input_path     = ./JAC_SOD2D/
+output_path    = ./RESULTS_eig/
+jac_file       = jacobian.hdf          # any .hdf of the Jacobian (single-file case)
+coord_file     = jacobian.hdf          # file with node_coords (any of the split files)
+sod2d_dumpfile = samg.matrix.coo       # default; written in output_path
+# vol_file is not used
+
+[physics]
+mach = 0.1
+beta = 0.0
+
+[solver]
+nev        = 10
+shift_real = 0.0
+shift_imag = 1.0
+adjoint    = True
+sensitivity = True
+# gen has no effect on the result: M = I
+
+[domain_reduction]
+enabled = True
+xmin = -2.0
+xmax = 20.0
+zmin = -5.0          # applied to the second coordinate column (y for SOD2D)
+zmax =  5.0
+```
+
+#### 2.4.4 Coordinates and post-processing
+
+- `read_sod2d_coordinates()` reads `node_coords`, scales it by `rlength` and
+  repeats each row `neq` times, giving the same one-row-per-DOF layout as a
+  TAU `.coo` file.
+- Domain reduction uses columns 0 and 1 of the coordinates. For SOD2D these
+  are $`x`$ and $`y`$, so the keys `zmin`/`zmax` bound **y**.
+- FLORES writes the coordinates of the **full mesh** to
+  `output_path/sod2d_dumpfile` (header `ndof 3`, one `x y z` row per DOF),
+  matching the `.pval` files, which are always written on the full mesh.
+  Plot with:
+
+  ```bash
+  python tools/plot_pval_eigfunction.py --modes 0-5 --dir RESULTS_eig/ \
+      --jac RESULTS_eig/ --neq 5 --vars u v
+  ```
+
+> ⚠️ **Open points for SOD2D** ([Chapter 11](#11-known-discrepancies-and-open-issues), items 24–27):
+> the mass matrix is the identity (there is a `TODO` about a factor 0.01 in
+> the code), it is not confirmed that the Mach scaling applies to SOD2D
+> Jacobians, and the resolvent does not support SOD2D.
 
 ---
 
@@ -1382,6 +1507,10 @@ Review of branch `miguel_dev`. Ordered by impact.
 | 8 | `resolvent_solver.py` | "Adjoint" operator $`\mathbf{P}^T\mathbf{M}^{-1}L^{-1}\mathbf{Q}L^{-H}\mathbf{P}`$ is not $`\mathbf{R}\mathbf{R}^\dagger`$. **Confirmed on a synthetic case:** at $`\omega = 0.5`$ the direct gains are 1.052, 0.667, 0.638 and the "adjoint" ones 1.651, 0.678, 0.619. | Redefine the adjoint operator (and the resolvent sensitivity that uses it). |
 | 9 | `resolvent_solver.py` | Energy norm $`\mathbf{Q}=\mathbf{M}`$ (not Chu). | Implement Chu (requires the base flow) or document it. |
 | 10 | `resolvent_solver.py` | $`\mathbf{P}`$ selects DOFs 1–2 (wrong for `beta ≠ 0`). | Choose the components according to `neq`/`beta`. |
+| 24 | `eig_solver.py` (SOD2D) | Mass matrix $`\mathbf{M}=\mathbf{I}`$: SOD2D does not export volumes. The code has a `TODO` about a factor 0.01 that used to multiply the identity. | Confirm the scaling of the SOD2D Jacobian (divided by the nodal mass or not), as for TAU's `Jacobian volume scaling`. |
+| 25 | `eig_solver.py` (SOD2D) | The Mach scaling $`1/(M_\infty\sqrt{\gamma})`$ of TAU is also applied to SOD2D. | Confirm SOD2D's non-dimensionalisation. |
+| 26 | `resolvent_solver.py` | No SOD2D support (`simulator` is not read). | Add the same reader switch and $`\mathbf{M}=\mathbf{I}`$; the forcing components for `rho, u, v, w, e` would be DOFs 1–3. |
+| 27 | `input_output.py` (SOD2D) | The split format is inferred from the files (zeros in `col_ptr`, file-name order); a column with no non-zeros at the start of a file would be lost. | Have SOD2D write the global column range of each file. |
 
 ### 11.2 Fixed
 
@@ -1402,6 +1531,12 @@ Review of branch `miguel_dev`. Ordered by impact.
 | 21 | `miguel_dev` vs `main` | `Cylinder_Re45` and newer README only on `main`. | `main` merged into `miguel_dev`. |
 | 22 | both solvers | `Mat.getVecs()` was removed in petsc4py 3.26 (crash; with several ranks the other ranks hung). | `Mat.createVecs()` (available in 3.25 too). |
 | 23 | `resolvent_solver.py` | `pcreate` passed int64 row pointers to `setPreallocationCSR`, which fails with 32-bit PETSc indices; full $`\mathbf{P}`$ built on every rank with Python loops. | Each rank builds its own rows of $`\mathbf{P}`$ (vectorised). |
+| 28 | SOD2D split reader | Files sorted lexicographically: with 10 or more files `jacobian_10.hdf` came before `jacobian_2.hdf` and the matrix was assembled wrongly; any file in `input_path` was read. | Natural order, `.hdf` files only. |
+| 29 | SOD2D readers | `neq` returned as a float (`n/numpoints`). | Integer, with a divisibility check. |
+| 30 | `eig_solver.py` (SOD2D) | Adjoint modes and sensitivity written with the TAU variable layout. | SOD2D layout (`rho, u, v, w, e`) for every `.pval`. |
+| 31 | `eig_solver.py` (SOD2D) | With domain reduction the `.coo` dump had only the kept nodes, while the `.pval` files are on the full mesh: fields were plotted at the wrong nodes. | Full mesh dumped. |
+| 32 | `tools/plot_pval_eigfunction.py` | `--neq` defined twice (argparse error at start-up). | One definition. |
+| 33 | installation scripts | `h5py` not installed; the Ubuntu script did not install scipy/netCDF4/matplotlib. | Installed by all three scripts. |
 
 ### 11.3 Validation of the fixes
 
@@ -1421,6 +1556,17 @@ ranks, PETSc/SLEPc 3.26 (complex) and MUMPS:
   block-tridiagonal operator (error 1e-15; the previous formula gave an error
   of order 10).
 
+SOD2D input was checked with synthetic HDF5 Jacobians (72 nodes, `neq = 5`),
+as a single file and split into 12 files:
+
+- both readers return exactly the source matrix (the previous split reader
+  returned a wrong matrix with 12 files);
+- `eig_solver.py` with `simulator = sod2d` (1 and 3 ranks, with and without
+  domain reduction) gives eigenvalues within 1e-8 of the dense reference;
+- every `.pval` has the variables `rho, u, v, w, e`, and with domain reduction
+  the non-zero values of the modes fall exactly inside the reduction box when
+  paired with the dumped `.coo`.
+
 
 ---
 
@@ -1438,9 +1584,12 @@ ranks, PETSc/SLEPc 3.26 (complex) and MUMPS:
 | NUMATH | Research group at ETSIAE/UPM. |
 | PC | Preconditioner; here the MUMPS LU factorisation. |
 | PETSc | Portable, Extensible Toolkit for Scientific computation. |
+| HDF5 | Hierarchical Data Format 5; file format of the SOD2D Jacobians. |
 | RANS | Reynolds-Averaged Navier–Stokes. |
 | SLEPc | Scalable Library for Eigenvalue Problem computations. |
 | ST | Spectral Transformation; here shift-invert. |
+| SOD2D | High-order spectral-element CFD solver whose Jacobians FLORES can read (eigenvalue solver). |
+| TAU | DLR TAU Code: finite-volume CFD solver of the German Aerospace Center. |
 | TRANSDIFFUSE | UPM research project under which FLORES is developed. |
 
 ---
