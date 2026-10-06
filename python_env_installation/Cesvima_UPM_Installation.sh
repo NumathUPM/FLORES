@@ -311,9 +311,9 @@ fi
 ### 7. Extra modules
 ### ------------------------------------------------------------
 
-if ! python3 -c "import scipy" &>/dev/null; then
+if ! python3 -c "import scipy, netCDF4, matplotlib, h5py" &>/dev/null; then
     echo ">>> Installing extra Python packages"
-    pip install netCDF4 scipy matplotlib
+    pip install netCDF4 scipy matplotlib h5py
 else
     echo ">>> [SKIP] Extra Python packages already installed"
 fi

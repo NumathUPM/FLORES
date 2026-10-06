@@ -410,7 +410,7 @@ PYEOF
 ### 9. Extra Python packages
 ### ------------------------------------------------------------
 
-pip install netCDF4 scipy matplotlib
+pip install netCDF4 scipy matplotlib h5py
 
 echo ""
 echo "========================================"

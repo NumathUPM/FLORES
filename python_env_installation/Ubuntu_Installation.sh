@@ -150,6 +150,17 @@ else
 fi
 
 ### ------------------------------------------------------------
+### 5b. Extra modules (I/O, post-processing, SOD2D input)
+### ------------------------------------------------------------
+
+if ! python3 -c "import scipy, netCDF4, matplotlib, h5py" &>/dev/null; then
+    echo ">>> Installing extra Python packages"
+    pip install netCDF4 scipy matplotlib h5py
+else
+    echo ">>> [SKIP] Extra Python packages already installed"
+fi
+
+### ------------------------------------------------------------
 ### 6. Patch activate (solo si no está ya parcheado)
 ### ------------------------------------------------------------
 
