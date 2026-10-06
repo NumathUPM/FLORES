@@ -570,9 +570,11 @@ def run_slices(params):
 
         n    = n_red
         rgid = rgid.astype(int)
-        # ── SOD2D: dump the kept coordinates to a TAU-like .coo file ──────
+        # ── SOD2D: dump the coordinates to a TAU-like .coo file ───────────
+        # Full mesh, not only the kept nodes: mode2pval scatters the reduced
+        # modes back onto the full mesh, so the .pval and .coo must match.
         if(is_simulator_sod2d and rank==0):
-            dump_sod2d_coordinates(sod2d_dumpfile, coord, neq, dr.kept_idx)
+            dump_sod2d_coordinates(sod2d_dumpfile, coord, neq)
     else:
         rgid = None
         n    = nvars
