@@ -7,6 +7,8 @@ python_env_installation/*
 # Files generated when running test cases or plotting
 test_cases/*
 !test_cases/*.floresparam
+RESULTS*/*
+JAC*/*.hdf
 
 *.dat
 *.png
