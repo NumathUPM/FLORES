@@ -943,11 +943,6 @@ def parse_args():
                         '(default: auto-detected from pval gridpoints). '
                         'E.g. --neq 6 for SA turbulence models.')
 
-    p.add_argument('--neq', type=int, default=None,
-                   help='Number of equations per node in the .coo file '
-                        '(default: auto-detected from pval gridpoints). '
-                        'E.g. --neq 6 for SA turbulence models.')
-
     p.add_argument('--mesh', default=None,
                    help='TAU NetCDF mesh file. E.g. --mesh MESH/BFS_h4_2D.taumesh')
 
