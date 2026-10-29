@@ -3,10 +3,9 @@
 from netCDF4 import Dataset
 import numpy as np
 import h5py
-from scipy.sparse import csr_matrix, csc_matrix
+from scipy.sparse import csr_matrix, csc_matrix, diags
 import sys,os
 import pdb
-
 ## ================================================================= ##
 
 def opendualgrid(duafile):
@@ -39,7 +38,7 @@ def openjacobian(jacfile):
     mjac.eliminate_zeros()
     return mjac, neq
 
-def open_sod2d_jacobian(input_path,jacfile):
+def open_sod2d_jacobian(input_path,jacfile, gen):
     # read from SOD2D's WIP hdf format
 
     hdfs_in_path = [x for x in os.listdir(input_path) if x.endswith(".hdf")]
@@ -49,21 +48,35 @@ def open_sod2d_jacobian(input_path,jacfile):
 
     f = h5py.File(jacfile,'r')
 
-    col_ptr = np.array(f['col_ptr'][:],dtype=np.int32)
-    row_ind = np.array(f['row_ind'][:],dtype=np.int32)
+    col_ptr = np.array(f['col_ptr'][:],dtype=np.int64)
+    row_ind = np.array(f['row_ind'][:],dtype=np.int64)
     values = np.array(f['values'][:],dtype=np.float64)
     coords = np.array(f['node_coords'][:],dtype=np.float64)
+    vols = np.array(f['vols'][:], dtype=np.float64)
+
+
+    # If solving the generalized eigenproblem, multiply on left by mass matrix
+    if(gen):
+        mult_vols = np.repeat(vols, 5)
+
+        for i in range(len(col_ptr)-1):
+            colstart = col_ptr[i]
+            nnz_this_col = col_ptr[i+1]-col_ptr[i]
+            for tape_idx in range(colstart,colstart+nnz_this_col):
+                row_idx = row_ind[tape_idx]
+                values[tape_idx] *= mult_vols[row_idx]
 
     n = len(col_ptr)-1
     numpoints = np.shape(coords)[0]
 
     neq = n/numpoints # number of eqs = number of degrees of freedom / number of nodes
 
-    mjac = csc_matrix((values,row_ind,col_ptr))
+    mjac = csc_matrix((values,row_ind,col_ptr), [len(col_ptr)-1,len(col_ptr)-1])
+
     mjac = mjac.tocsr()
     mjac.eliminate_zeros()
 
-    return mjac, neq
+    return mjac, neq, vols
 
 def open_split_sod2d_jacobian(input_path):
     # read from SOD2D's WIP hdf format

@@ -7,7 +7,7 @@ import numpy as np
 import sys, os
 import time
 import configparser
-from scipy.sparse import csr_matrix, linalg as sla, identity
+from scipy.sparse import csr_matrix, linalg as sla, identity, diags
 
 from jac_red import domain_reduction
 from save2pval import mode2pval, mode2pval3D
@@ -271,7 +271,7 @@ def solve_eigenproblem(A, B, nev, ncv, the_shift, tol, max_it, gen,
 
 def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
                                    nvars, n, neq, beta, dreduced, rgid,
-                                   output_path, rank):
+                                   output_path, rank, is_simulator_sod2d):
     """
     Compute and save the structural sensitivity for each mode pair.
 
@@ -346,7 +346,7 @@ def compute_structural_sensitivity(dir_vecs, adj_vecs, B,
 
             outfile = os.path.join(output_path,
                                    'sensitivity_{0}.pval'.format(i))
-            mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid)
+            mode2pval(outfile, sens_pvec, nvars, n, neq, beta, dreduced, rgid, is_simulator_sod2d)
             if beta != 0:
                 mode2pval3D(outfile, sens_pvec, nvars, n, neq, beta, 21,
                             dreduced, rgid)
@@ -466,7 +466,7 @@ def run_slices(params):
     Print(' Reading Jacobian')
     if rank == 0:
         if(is_simulator_sod2d):
-            amatrix, neq = open_sod2d_jacobian(input_path,jacfile)
+            amatrix, neq, sod2d_vols = open_sod2d_jacobian(input_path,jacfile, gen)
         else:
             amatrix, neq = openjacobian(jacfile)
         amatrix.data *= fac
@@ -476,6 +476,7 @@ def run_slices(params):
     else:
         meta = np.empty(3, dtype=np.int64)
 
+    print(f"nvars before comm is {nvars}")
     comm.Bcast(meta, root=0)
     neq, nvars, nnz = int(meta[0]), int(meta[1]), int(meta[2])
 
@@ -508,7 +509,7 @@ def run_slices(params):
     Print('')
     if rank == 0:
         if(is_simulator_sod2d):
-            vols_buf = np.repeat(1,nvars).astype(np.float64)
+            vols_buf = sod2d_vols
         else:
             with open(volfile, 'r') as f:
                 vols_buf = np.array([float(line) for line in f.readlines()],
@@ -521,11 +522,8 @@ def run_slices(params):
     if rank != 0:
         vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
     comm.Bcast(vols_buf, root=0)
-
-    # TODO had a 0.01 multiplying identity mat here - find out why
     bmatrix = identity(nvars, dtype='c16', format='csr')
-    if(not is_simulator_sod2d):
-        bmatrix.data[:] = np.repeat(vols_buf, neq).astype(np.complex128)
+    bmatrix.data[:] = np.repeat(vols_buf, neq).astype(np.complex128)
     _t(comm, rank, 'Mass matrix build', t0)
 
     # ── Domain reduction — rank 0 only, then broadcast ──────────────────────
@@ -795,7 +793,7 @@ def run_slices(params):
                 scatter_a, adjvec = PETSc.Scatter.toZero(yr)
                 scatter_a.scatter(yr, adjvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
-                    mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid)
+                    mode2pval(adjvecfile, adjvec, nvars, n, neq, beta, dreduced, rgid, is_simulator_sod2d)
                     if beta != 0:
                         mode2pval3D(adjvecfile, adjvec, nvars, n, neq, beta, 21,
                                     dreduced, rgid)
@@ -835,7 +833,7 @@ def run_slices(params):
             compute_structural_sensitivity(
                 dir_vecs_kept, adj_vecs_kept, B,
                 nvars, n, neq, beta, dreduced, rgid,
-                output_path, rank)
+                output_path, rank, is_simulator_sod2d)
             _t(comm, rank, 'Structural sensitivity', t0)
         elif sensitivity:
             Print(' WARNING: no mode pairs available for sensitivity computation.')
