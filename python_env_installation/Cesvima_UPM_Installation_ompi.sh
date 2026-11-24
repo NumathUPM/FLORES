@@ -2,23 +2,22 @@
 set -e
 
 ### ------------------------------------------------------------
-### Environment modules
+### Environment modules (toolchain foss/2025a, GCC 14.2.0)
 ### ------------------------------------------------------------
 
+MODULES="OpenMPI/5.0.7-GCC-14.2.0 OpenBLAS/0.3.29-GCC-14.2.0 ScaLAPACK/2.2.2-gompi-2025a-fb METIS/5.1.0-GCCcore-14.2.0 SCOTCH/7.0.8-gompi-2025a Python/3.13.1-GCCcore-14.2.0"
+
 module purge
-module load apps/2021
-module load GCC/10.3.0
-module load OpenMPI/4.1.1-GCC-10.3.0
-module load OpenBLAS/0.3.15-GCC-10.3.0
-module load ScaLAPACK/2.1.0-gompi-2021a-fb
-module load METIS/5.1.0-GCCcore-10.3.0
-module load SCOTCH/6.1.0-gompi-2021a
+module load apps/avx512-2025
+module load $MODULES
 
 echo "MPI      : $EBROOTOPENMPI"
 echo "OpenBLAS : $EBROOTOPENBLAS"
 echo "ScaLAPACK: $EBROOTSCALAPACK"
 echo "METIS    : $EBROOTMETIS"
 echo "SCOTCH   : $EBROOTSCOTCH"
+echo "GCC      : $(gcc --version | head -1)"
+echo "Python   : $(which python3) ($(python3 --version 2>&1))"
 
 ### ------------------------------------------------------------
 ### 0. Project setup
@@ -31,14 +30,12 @@ PETSC_ARCH="arch-linux-c-opt-ompi"
 SLEPC_SRC="$PROJECT_DIR/slepc_ompi"
 MUMPS_SRC="$PROJECT_DIR/mumps"
 MUMPS_INSTALL="$PROJECT_DIR/mumps_install"
+ENV_FILE="$PROJECT_DIR/load_env_flores.sh"
 
 NPROC=$(nproc)
 
 echo ">>> Project dir : $PROJECT_DIR"
 echo ">>> NPROC       : $NPROC"
-
-# --- GCC runtime necesario para libgfortran.so.4 ---
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/media/apps/avx512/software/GCCcore/7.2.0/lib64"
 
 # --- Rutas de dependencias del sistema ---
 MPI_DIR="$EBROOTOPENMPI"
@@ -50,12 +47,19 @@ SCOTCH_DIR="$EBROOTSCOTCH"
 # --- Verificar que las variables del entorno estan definidas ---
 for var in MPI_DIR OPENBLAS_DIR SCALAPACK_DIR METIS_DIR SCOTCH_DIR; do
     if [ -z "${!var}" ]; then
-        echo "ERROR: $var no esta definida. Ejecuta primero: source load_env_STAB_tool.sh"
+        echo "ERROR: $var no esta definida. Revisa los module load del principio"
         exit 1
     fi
     echo "    $var = ${!var}"
 done
 
+# --- Verificar que el Python cargado trae Python.h ---
+PY_INCLUDE="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
+if [ ! -f "$PY_INCLUDE/Python.h" ]; then
+    echo "ERROR: no se encuentra $PY_INCLUDE/Python.h"
+    exit 1
+fi
+echo "    Python.h = $PY_INCLUDE/Python.h"
 
 ### ------------------------------------------------------------
 ### Checkpoint system
@@ -81,6 +85,16 @@ fi
 ### 0.1 Virtual environment
 ### ------------------------------------------------------------
 
+# Un venv creado con otro Python (p. ej. el del sistema, sin Python.h) no sirve
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    VENV_PY_INCLUDE="$("$VENV_DIR/bin/python3" -c 'import sysconfig; print(sysconfig.get_paths()["include"])' 2>/dev/null || true)"
+    if [ ! -f "$VENV_PY_INCLUDE/Python.h" ]; then
+        echo "ERROR: $VENV_DIR se creo con otro Python (sin cabeceras o roto)."
+        echo "       Borralo (rm -rf $VENV_DIR) y vuelve a ejecutar el script."
+        exit 1
+    fi
+fi
+
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo ">>> Creating virtual environment: $VENV_DIR"
     python3 -m venv "$VENV_DIR"
@@ -91,9 +105,9 @@ fi
 source "$VENV_DIR/bin/activate"
 checkpoint_done "venv"
 
-if ! python3 -c "import numpy" &>/dev/null; then
+if ! python3 -c "import numpy, Cython" &>/dev/null; then
     echo ">>> Installing base Python packages"
-    pip install --upgrade pip setuptools wheel numpy
+    pip install --upgrade pip setuptools wheel numpy cython
 else
     echo ">>> [SKIP] Base Python packages already installed"
 fi
@@ -132,8 +146,10 @@ OUTF    = -o
 OUTC    = -o
 
 # ── Optimization + OpenMP ────────────────────────────────────
+# -fpermissive: GCC >= 14 trata como error codigo C antiguo
+# (declaraciones implicitas, punteros incompatibles)
 OPTF    = -O3 -fopenmp -march=native -funroll-loops -fallow-argument-mismatch -fPIC
-OPTC    = -O3 -fopenmp -march=native -funroll-loops -fPIC
+OPTC    = -O3 -fopenmp -march=native -funroll-loops -fPIC -fpermissive
 OPTL    = -fopenmp
 
 # ── BLAS/LAPACK (OpenBLAS) ───────────────────────────────────
@@ -181,16 +197,15 @@ LIBEXT        = .a
 LIBEXT_SHARED =
 FPIC          = -fPIC
 RANLIB        = ranlib
-AR            = ar cr 
+AR            = ar cr
 EOF
-
 
     # Step 1: PORD — los .c estan directamente en PORD/lib/
     echo "    Step 1/3: Compiling PORD (manual)..."
     cd "$MUMPS_SRC/PORD/lib"
     for src in *.c; do
         obj="${src%.c}.o"
-        cc -I../include -O3 -fopenmp -march=native -c "$src" -o "$obj"
+        gcc -I../include -O3 -fopenmp -march=native -fPIC -fpermissive -c "$src" -o "$obj"
     done
     ar cr libpord.a *.o
     ranlib libpord.a
@@ -237,6 +252,8 @@ if ! checkpoint_check "petsc_conf" && [ ! -f "$PETSC_SRC/$PETSC_ARCH/lib/petsc/c
     # Construir la lista de libs de MUMPS en una sola linea sin espacios ni saltos
     MUMPS_LIBS="[${MUMPS_INSTALL}/lib/libzmumps.a,${MUMPS_INSTALL}/lib/libmumps_common.a,${MUMPS_INSTALL}/lib/libpord.a,-L${SCALAPACK_DIR}/lib,-lscalapack,-L${OPENBLAS_DIR}/lib,-lopenblas,-L${METIS_DIR}/lib,-lmetis,-L${SCOTCH_DIR}/lib,-lptesmumps,-lptscotch,-lptscotcherr,-lscotch,-lscotcherr,-L${MPI_DIR}/lib,-lmpi_mpifh,-lmpi,-lgomp,-lpthread,-lm]"
 
+    # METIS del modulo del sistema (la misma que usa MUMPS); los nodos no
+    # tienen acceso a bitbucket.org, asi que no se usa --download-metis
     ./configure \
       --PETSC_ARCH="$PETSC_ARCH" \
       --with-debugging=0 \
@@ -248,8 +265,8 @@ if ! checkpoint_check "petsc_conf" && [ ! -f "$PETSC_SRC/$PETSC_ARCH/lib/petsc/c
       --with-scalapack-dir="$SCALAPACK_DIR" \
       --with-mumps-include="${MUMPS_INSTALL}/include" \
       --with-mumps-lib="${MUMPS_LIBS}" \
+      --with-metis-dir="$METIS_DIR" \
       --download-cmake \
-      --download-metis \
       COPTFLAGS="-O3 -march=native -fopenmp" \
       FOPTFLAGS="-O3 -march=native -fopenmp" \
       CXXOPTFLAGS="-O3 -march=native -fopenmp" \
@@ -299,6 +316,8 @@ else
     checkpoint_done "slepc"
 fi
 
+cd "$PROJECT_DIR"
+
 ### ------------------------------------------------------------
 ### 4. mpi4py
 ### ------------------------------------------------------------
@@ -306,42 +325,32 @@ fi
 if ! python3 -c "import mpi4py" &>/dev/null; then
     echo ">>> Installing mpi4py"
     pip uninstall -y mpi4py || true
-    pip cache purge
-    pip install --no-binary=mpi4py mpi4py
+    pip cache purge || true
+    MPICC="$MPI_DIR/bin/mpicc" pip install --no-binary=mpi4py mpi4py
 else
     echo ">>> [SKIP] mpi4py already installed"
 fi
 
 ### ------------------------------------------------------------
-### 5. petsc4py
+### 5. petsc4py (desde el propio arbol de PETSc: misma version)
 ### ------------------------------------------------------------
 
 if ! python3 -c "import petsc4py" &>/dev/null; then
-    echo ">>> Installing petsc4py"
+    echo ">>> Installing petsc4py from $PETSC_DIR/src/binding/petsc4py"
     pip uninstall -y petsc petsc4py || true
-    pip cache purge
-    CFLAGS="-O0 -g0" MAX_JOBS=1 pip install \
-      --no-binary=petsc4py \
-      --no-binary=petsc \
-      --no-deps \
-      "petsc4py==3.25.0"
+    pip install --no-deps --no-build-isolation "$PETSC_DIR/src/binding/petsc4py"
 else
     echo ">>> [SKIP] petsc4py already installed"
 fi
 
 ### ------------------------------------------------------------
-### 6. slepc4py
+### 6. slepc4py (desde el propio arbol de SLEPc: misma version)
 ### ------------------------------------------------------------
 
 if ! python3 -c "import slepc4py" &>/dev/null; then
-    echo ">>> Installing slepc4py"
+    echo ">>> Installing slepc4py from $SLEPC_DIR/src/binding/slepc4py"
     pip uninstall -y slepc slepc4py || true
-    pip cache purge
-    CFLAGS="-O0 -g0" MAX_JOBS=1 pip install \
-      --no-binary=slepc4py \
-      --no-binary=slepc \
-      --no-deps \
-      "slepc4py==3.25.0"
+    pip install --no-deps --no-build-isolation "$SLEPC_DIR/src/binding/slepc4py"
 else
     echo ">>> [SKIP] slepc4py already installed"
 fi
@@ -356,8 +365,8 @@ if ! grep -q "PETSC_DIR" "$ACTIVATE_FILE"; then
     echo ">>> Patching activate script"
     cat << EOF >> "$ACTIVATE_FILE"
 
-# --- GCC runtime (libgfortran.so.4) ---
-export LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:/media/apps/avx512/software/GCCcore/7.2.0/lib64"
+# --- NOTA: antes de activar este entorno hay que cargar los modulos
+# --- (o usar directamente: source $ENV_FILE)
 
 # --- PETSc configuration (inplace) ---
 export PETSC_DIR="$PETSC_SRC"
@@ -376,11 +385,24 @@ export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 
 # --- MPI compiler wrapper ---
-export MPICC="\$PETSC_DIR/\$PETSC_ARCH/bin/mpicc"
+export MPICC="$MPI_DIR/bin/mpicc"
 EOF
 else
     echo ">>> [SKIP] activate script already patched"
 fi
+
+### ------------------------------------------------------------
+### 7.1 Script de entorno (modulos + venv) para sesiones y .slurm
+### ------------------------------------------------------------
+
+cat > "$ENV_FILE" << EOF
+# Uso: source $ENV_FILE
+module purge
+module load apps/avx512-2025
+module load $MODULES
+source "$VENV_DIR/bin/activate"
+EOF
+echo ">>> Written $ENV_FILE"
 
 ### ------------------------------------------------------------
 ### 8. Sanity check
@@ -396,14 +418,12 @@ import sys
 print("PETSc version :", PETSc.Sys.getVersion())
 print("SLEPc version :", SLEPc.Sys.getVersion())
 print("MPI size      :", MPI.COMM_WORLD.Get_size())
+print("Scalar type   :", PETSc.ScalarType)
 
-try:
-    opts = PETSc.Options()
-    opts["pc_factor_mat_solver_type"] = "mumps"
-    print("MUMPS         : OK")
-except Exception as e:
-    print("MUMPS         : ERROR —", e)
+if not PETSc.Sys.hasExternalPackage("mumps"):
+    print("MUMPS         : ERROR - PETSc compilado sin MUMPS")
     sys.exit(1)
+print("MUMPS         : OK")
 PYEOF
 
 ### ------------------------------------------------------------
@@ -417,13 +437,13 @@ echo "========================================"
 echo " Installation complete!"
 echo "========================================"
 echo ""
-echo " Entorno original : source $PROJECT_DIR/myvenv/bin/activate"
-echo " Entorno OMP      : source $PROJECT_DIR/myvenv_omp/bin/activate"
+echo " Activar el entorno (sesion interactiva o .slurm):"
+echo "   source $ENV_FILE"
 echo ""
 echo " MUMPS 5.5.1 compilado con:"
 echo "   - OpenMP (-fopenmp + BLR_MT)"
 echo "   - MPI distribuido"
-echo "   - METIS + ParMETIS"
+echo "   - METIS"
 echo "   - SCOTCH + PT-Scotch"
 echo ""
 echo " Job script recomendado:"
