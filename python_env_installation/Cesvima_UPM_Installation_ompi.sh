@@ -61,6 +61,7 @@ if [ ! -f "$PY_INCLUDE/Python.h" ]; then
 fi
 echo "    Python.h = $PY_INCLUDE/Python.h"
 
+
 ### ------------------------------------------------------------
 ### Checkpoint system
 ### ------------------------------------------------------------
@@ -197,8 +198,9 @@ LIBEXT        = .a
 LIBEXT_SHARED =
 FPIC          = -fPIC
 RANLIB        = ranlib
-AR            = ar cr
+AR            = ar cr 
 EOF
+
 
     # Step 1: PORD — los .c estan directamente en PORD/lib/
     echo "    Step 1/3: Compiling PORD (manual)..."
@@ -245,6 +247,8 @@ export PETSC_DIR="$PETSC_SRC"
 export PETSC_ARCH="$PETSC_ARCH"
 export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:$LD_LIBRARY_PATH"
 export MPICC="$(which mpicc)"
+mkdir -p "$PROJECT_DIR/.noreadline"; echo "raise ImportError" > "$PROJECT_DIR/.noreadline/readline.py"
+export PYTHONPATH="$PROJECT_DIR/.noreadline${PYTHONPATH:+:$PYTHONPATH}"
 
 if ! checkpoint_check "petsc_conf" && [ ! -f "$PETSC_SRC/$PETSC_ARCH/lib/petsc/conf/petscvariables" ]; then
     echo ">>> Configuring PETSc"
@@ -254,7 +258,7 @@ if ! checkpoint_check "petsc_conf" && [ ! -f "$PETSC_SRC/$PETSC_ARCH/lib/petsc/c
 
     # METIS del modulo del sistema (la misma que usa MUMPS); los nodos no
     # tienen acceso a bitbucket.org, asi que no se usa --download-metis
-    ./configure \
+    /usr/bin/python3 -X faulthandler ./configure \
       --PETSC_ARCH="$PETSC_ARCH" \
       --with-debugging=0 \
       --with-shared-libraries=1 \
@@ -266,7 +270,6 @@ if ! checkpoint_check "petsc_conf" && [ ! -f "$PETSC_SRC/$PETSC_ARCH/lib/petsc/c
       --with-mumps-include="${MUMPS_INSTALL}/include" \
       --with-mumps-lib="${MUMPS_LIBS}" \
       --with-metis-dir="$METIS_DIR" \
-      --download-cmake \
       COPTFLAGS="-O3 -march=native -fopenmp" \
       FOPTFLAGS="-O3 -march=native -fopenmp" \
       CXXOPTFLAGS="-O3 -march=native -fopenmp" \
@@ -302,7 +305,7 @@ export LD_LIBRARY_PATH="$SLEPC_DIR/$PETSC_ARCH/lib:$LD_LIBRARY_PATH"
 if [ ! -f "$SLEPC_SRC/$PETSC_ARCH/lib/slepc/conf/slepcvariables" ]; then
     echo ">>> Configuring SLEPc"
     cd "$SLEPC_SRC"
-    ./configure
+    /usr/bin/python3 -X faulthandler ./configure
 else
     echo ">>> [SKIP] SLEPc already configured"
 fi
@@ -396,7 +399,7 @@ fi
 ### ------------------------------------------------------------
 
 cat > "$ENV_FILE" << EOF
-# Uso: source $ENV_FILE
+# Uso:  source $ENV_FILE
 module purge
 module load apps/avx512-2025
 module load $MODULES
