@@ -7,8 +7,33 @@ matrix to every rank, rank 0 sends each rank just the block of rows it owns
 in the PETSc layout, so the memory per rank scales with 1/nproc.
 """
 
+import sys
+import traceback
 import numpy as np
 from petsc4py import PETSc
+from mpi4py import MPI
+
+
+def run_or_abort(func, *args, **kwargs):
+    """
+    Run func(*args, **kwargs); if any rank raises, print the traceback and
+    abort the whole MPI job.
+
+    Many steps run on rank 0 only (reading the Jacobian, coordinates...)
+    while the other ranks wait in a collective call. Without this, an
+    exception on rank 0 leaves the other ranks blocked forever: the job
+    hangs without an error until the scheduler cancels it.
+    """
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        rank = MPI.COMM_WORLD.Get_rank()
+        sys.stdout.flush()
+        sys.stderr.write('\n *** ERROR on MPI rank {0}: aborting the job ***\n'
+                         .format(rank))
+        traceback.print_exc()
+        sys.stderr.flush()
+        MPI.COMM_WORLD.Abort(1)
 
 
 def ownership_ranges(n, nproc):

@@ -279,6 +279,32 @@ def read_coordinates(coordfile, rlength, beta):
 
     return new_data
 
+def check_input_files(simulator, input_path, jacfile, volfile=None,
+                      coofile=None):
+    """
+    Check up front that the input directory and files exist, so a typo in the
+    control file fails immediately with a clear message (on every rank)
+    instead of deep inside the reading routines.
+    """
+    if not os.path.isdir(input_path):
+        raise FileNotFoundError(
+            "input_path '{0}' does not exist (current directory: {1}). "
+            "Check [io] input_path in the control file.".format(
+                input_path, os.getcwd()))
+    if simulator == 'sod2d':
+        hdfs = [x for x in os.listdir(input_path) if x.endswith('.hdf')]
+        if not os.path.isfile(jacfile) and not hdfs:
+            raise FileNotFoundError(
+                "No SOD2D Jacobian: '{0}' does not exist and there are no "
+                ".hdf files in '{1}'.".format(jacfile, input_path))
+    else:
+        missing = [f for f in (jacfile, volfile, coofile)
+                   if f is not None and not os.path.isfile(f)]
+        if missing:
+            raise FileNotFoundError(
+                "Input file(s) not found: " + ", ".join(missing))
+
+
 def find_sod2d_coord_file(coordfile, jacfile, input_path):
     """
     Return the HDF5 file holding the SOD2D node coordinates (dataset

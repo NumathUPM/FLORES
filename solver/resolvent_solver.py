@@ -12,8 +12,8 @@ from jac_red import domain_reduction
 from save2pval import mode2pval
 from input_output import (openjacobian, read_coordinates, open_sod2d_jacobian,
                           read_sod2d_coordinates, dump_sod2d_coordinates,
-                          find_sod2d_coord_file)
-from mpi_utils import assemble_aij, assemble_diag, ownership_ranges
+                          find_sod2d_coord_file, check_input_files)
+from mpi_utils import assemble_aij, assemble_diag, run_or_abort, ownership_ranges
 
 import petsc4py
 import slepc4py
@@ -378,6 +378,8 @@ def run_slices(params):
     jacfile = os.path.join(input_path, params['jac_file'])
     volfile = os.path.join(input_path, params['vol_file'])
     coofile = os.path.join(input_path, params['coord_file'])
+    check_input_files(simulator, input_path, jacfile, volfile,
+                      coofile if dreduced else None)
     if is_simulator_sod2d:
         coofile = find_sod2d_coord_file(coofile, jacfile, input_path)
     sod2d_dumpfile = os.path.join(input_path, params['sod2d_dumpfile'])
@@ -787,4 +789,4 @@ if __name__ == "__main__":
 
     ctrl_file = sys.argv[1]
     params    = read_control_file(ctrl_file)
-    run_slices(params)
+    run_or_abort(run_slices, params)
