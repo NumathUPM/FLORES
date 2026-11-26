@@ -208,6 +208,22 @@ class resolvant(object):
         Print('')
         self.ksp.setUp()
 
+        # A singular or badly factorised L gives NaN/inf that only show up
+        # much later as an obscure SLEPc error ("inner product is not well
+        # defined"). Test the factorisation with one solve to fail early.
+        rhs, sol = self.J.createVecs()
+        rhs.setRandom()
+        self.ksp.solve(rhs, sol)
+        nrm = sol.norm()
+        rhs.destroy(); sol.destroy()
+        if not np.isfinite(nrm):
+            raise RuntimeError(
+                'The LU factorisation of L = i*w*I - A at w = {0} is singular '
+                '(solving L x = b gave NaN/inf). Typical cause: A has empty '
+                'columns/rows (e.g. SOD2D boundary nodes where the BC overwrites '
+                'the perturbation), which makes L singular at w = 0. Use '
+                'omega_start > 0 or constrain those DOFs.'.format(w))
+
     def cleanup(self):
         if self.ksp is not None:
             self.ksp.destroy()
@@ -549,6 +565,19 @@ def run_slices(params):
         # SOD2D Jacobian has the opposite sign to TAU's: flip it to follow
         # the TAU convention (same as eig_solver.py)
         amatrix.data *= fac * (-1.0 if is_simulator_sod2d else 1.0)
+
+        # Empty rows/columns make L = i*w*I - A singular at w = 0
+        _csr  = amatrix.tocsr()
+        _ncol = int(np.count_nonzero(
+            np.bincount(_csr.indices, minlength=_csr.shape[1]) == 0))
+        _nrow = int(np.count_nonzero(np.diff(_csr.indptr) == 0))
+        Print(' A: {0} empty columns, {1} empty rows (out of {2})'.format(
+              _ncol, _nrow, _csr.shape[0]))
+        if (_ncol or _nrow) and any(abs(w) == 0 for w in listomegas):
+            Print(' WARNING: A has empty rows/columns and omega = 0 is in the '
+                  'frequency list: L = -A is singular at omega = 0. Use '
+                  'omega_start > 0.')
+        del _csr
 
     A    = assemble_aij(comm, amatrix if rank == 0 else None, n)
     Print(' Assembled A (Jacobian)')
