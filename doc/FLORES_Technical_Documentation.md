@@ -1387,6 +1387,13 @@ sensitivity).
   the Jacobian drop their triangles). The body contour comes from the
   boundary faces; the ids found are printed and `--bound-ids` selects which
   ones are drawn (default: all).
+- **SOD2D partitioned mesh (`--mesh MESH/back_facing_buffer-112.hdf`):** chosen
+  by the `.hdf` extension (one piece per MPI rank). `load_sod2dmesh_partitioned()`
+  reads the linear hexahedra of the `/VTKHDF` group (`isLinealOutput`), takes
+  the faces lying on the lowest $`z`$ plane, splits them into triangles and
+  merges the nodes shared between ranks by coordinates. The body contour is the
+  free boundary of that plane triangulation (it includes the outer domain
+  boundary; use `--xlim`/`--ylim`). `--bound-ids` does not apply.
 - **Rendering:** Delaunay triangulation (`matplotlib.tri`) or the TAU
   connectivity; `tripcolor` with `shading='gouraud'`.
 - **Colour map:** `coolwarm` with a symmetric `TwoSlopeNorm`, clipped at

@@ -29,7 +29,8 @@ QUICK REFERENCE
 COORDINATES (one of these is required)
   Default .coo file  : JAC/samg.matrix.coo  (use --jac to change directory)
   TAU mesh NetCDF    : --mesh MESH/BFS_h4_2D.taumesh
-  SOD2D mesh HDF5    : --mesh MESH/back_facing.h5  [--bound-ids 3 4]
+  SOD2D mesh (serial): --mesh MESH/back_facing.h5  [--bound-ids 3 4]
+  SOD2D mesh (partit): --mesh MESH/back_facing_buffer-112.hdf
 
 INPUT (one of these is required)
   Single .pval file  : python plot_pval_eigfunction.py path/to/eigf_0_1.2j.pval
@@ -557,6 +558,110 @@ def load_sod2dmesh(path, bound_ids=None):
 
     return x, y, triang, contours, None
 
+
+def load_sod2dmesh_partitioned(path):
+    """
+    Read a partitioned SOD2D mesh (.hdf, e.g. back_facing_buffer-112.hdf, one
+    piece per MPI rank) through its /VTKHDF group: linear hexahedra obtained
+    by subdividing the high-order elements (isLinealOutput).
+
+    The lowest z plane is extracted: every hexahedron face lying on it gives a
+    quad, split into two triangles. The pieces of the different ranks are
+    merged by coordinates (nodes shared between ranks are duplicated in the
+    file). The body contour is the free boundary of that 2D triangulation
+    (edges used by one triangle), so it includes the outer domain boundary:
+    use --xlim/--ylim to look at the region of interest.
+
+    Returns the same tuple as load_taumesh:
+      x, y, triang, body_contour, None
+    """
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError('Reading a SOD2D mesh requires h5py (pip install h5py)')
+
+    print(f"  Reading partitioned SOD2D mesh: {path}")
+    with h5py.File(path, 'r') as f:
+        if 'VTKHDF' not in f:
+            raise ValueError("No /VTKHDF group in the file: it is not a "
+                             "partitioned SOD2D mesh")
+        g      = f['VTKHDF']
+        pts    = np.asarray(g['Points'][:], dtype=np.float64)
+        conn   = np.asarray(g['Connectivity'][:], dtype=np.int64)
+        types  = np.asarray(g['Types'][:])
+        npts_r = np.asarray(g['NumberOfPoints'][:], dtype=np.int64)
+        ncel_r = np.asarray(g['NumberOfCells'][:], dtype=np.int64)
+        ncon_r = np.asarray(g['NumberOfConnectivityIds'][:], dtype=np.int64)
+
+    nranks = len(npts_r)
+    print(f"    ranks = {nranks}   points = {len(pts)}   cells = {ncel_r.sum()}")
+    if not (types == 12).all() or ncon_r.sum() != 8 * ncel_r.sum():
+        raise ValueError("Only linear hexahedra (VTK type 12) are supported: "
+                         "the mesh must be written with isLinealOutput = 1")
+
+    pstart = np.concatenate(([0], np.cumsum(npts_r)))
+    cstart = np.concatenate(([0], np.cumsum(ncel_r)))
+    nstart = np.concatenate(([0], np.cumsum(ncon_r)))
+
+    # connectivity ids are local to each piece (VTKHDF); tolerate global ids
+    cells = np.empty((int(ncel_r.sum()), 8), dtype=np.int64)
+    for r in range(nranks):
+        c = conn[nstart[r]:nstart[r + 1]]
+        if r > 0 and c.size and c.min() >= pstart[r]:
+            off = 0                         # already global
+        else:
+            off = pstart[r]
+        cells[cstart[r]:cstart[r + 1]] = (c + off).reshape(-1, 8)
+
+    z    = pts[:, 2]
+    zmin = float(z.min())
+    ztol = 1e-6 * max(1.0, float(np.ptp(z)))
+    on_plane = np.abs(z - zmin) <= ztol
+
+    # faces of a VTK hexahedron (cyclic node order)
+    faces = ([0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4],
+             [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7])
+    quads = []
+    for fc in faces:
+        q = cells[:, fc]
+        quads.append(q[on_plane[q].all(axis=1)])
+    quads = np.vstack(quads)
+    if quads.shape[0] == 0:
+        raise ValueError(f"No hexahedron face lies on the plane z={zmin}")
+    print(f"    plane z = {zmin:.6g}: {quads.shape[0]} quads")
+
+    # merge the nodes shared between ranks (same x,y)
+    used = np.unique(quads)
+    xy   = pts[used, :2]
+    span = max(float(np.ptp(xy[:, 0])), float(np.ptp(xy[:, 1])), 1.0)
+    key  = np.round(xy / (1e-9 * span)).astype(np.int64)
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    inv = np.ravel(inv)
+    x = xy[first, 0]
+    y = xy[first, 1]
+    remap = np.full(len(pts), -1, dtype=np.int64)
+    remap[used] = inv
+    quads = remap[quads]
+    print(f"    plane nodes after merging ranks: {len(x)}   "
+          f"x∈[{x.min():.4g}, {x.max():.4g}]   y∈[{y.min():.4g}, {y.max():.4g}]")
+
+    tris = np.vstack((quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]))
+    a  = np.column_stack((x[tris[:, 1]] - x[tris[:, 0]], y[tris[:, 1]] - y[tris[:, 0]]))
+    b  = np.column_stack((x[tris[:, 2]] - x[tris[:, 0]], y[tris[:, 2]] - y[tris[:, 0]]))
+    tris = tris[np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]) > 1e-14]
+    print(f"    Total triangles: {len(tris)}")
+    triang = tri.Triangulation(x, y, tris)
+
+    # body contour = free edges of the plane triangulation
+    e = np.sort(np.vstack((tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]])), axis=1)
+    ue, cnt = np.unique(e, axis=0, return_counts=True)
+    free = ue[cnt == 1]
+    print(f"    Free boundary edges: {len(free)}")
+    nan = np.full(len(free), np.nan)
+    cx = np.column_stack((x[free[:, 0]], x[free[:, 1]], nan)).ravel()
+    cy = np.column_stack((y[free[:, 0]], y[free[:, 1]], nan)).ravel()
+    return x, y, triang, [np.column_stack((cx, cy))], None
+
 # ── pval reader ────────────────────────────────────────────────────────────────
 
 def read_pval(path, vars_to_plot):
@@ -1060,9 +1165,10 @@ def parse_args():
                         'E.g. --neq 6 for SA turbulence models.')
 
     p.add_argument('--mesh', default=None,
-                   help='Mesh file: TAU NetCDF (--mesh MESH/BFS_h4_2D.taumesh) or '
-                        'SOD2D HDF5 (--mesh MESH/back_facing.h5, picked by the '
-                        '.h5 extension)')
+                   help='Mesh file: TAU NetCDF (--mesh MESH/BFS_h4_2D.taumesh), '
+                        'SOD2D serial mesh (--mesh MESH/back_facing.h5) or SOD2D '
+                        'partitioned mesh (--mesh MESH/back_facing_buffer-112.hdf). '
+                        'The type is picked by the extension (.h5 / .hdf)')
 
     p.add_argument('--bound-ids', nargs='+', type=int, default=None, metavar='ID',
                    help='SOD2D mesh only: boundary ids (boundFacesId) to draw as '
@@ -1175,6 +1281,9 @@ def main():
         if args.mesh.lower().endswith('.h5'):
             x_tau, y_tau, mesh_triang, body_contour, mesh_quads = \
                 load_sod2dmesh(args.mesh, bound_ids=args.bound_ids)
+        elif args.mesh.lower().endswith('.hdf'):
+            x_tau, y_tau, mesh_triang, body_contour, mesh_quads = \
+                load_sod2dmesh_partitioned(args.mesh)
         else:
             x_tau, y_tau, mesh_triang, body_contour, mesh_quads = load_taumesh(args.mesh)
         if not os.path.isfile(coords_path):
