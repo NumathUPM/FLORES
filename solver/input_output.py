@@ -279,6 +279,31 @@ def read_coordinates(coordfile, rlength, beta):
 
     return new_data
 
+def find_sod2d_coord_file(coordfile, jacfile, input_path):
+    """
+    Return the HDF5 file holding the SOD2D node coordinates (dataset
+    node_coords). coord_file is used if it is an HDF5 file; otherwise (e.g.
+    the default samg.matrix.coo, a text file) fall back to the Jacobian file
+    and then to the first .hdf file in input_path.
+    """
+    h5py = _import_h5py()
+    candidates = [coordfile, jacfile]
+    if os.path.isdir(input_path):
+        candidates += [os.path.join(input_path, x)
+                       for x in sorted(os.listdir(input_path), key=_natural_key)
+                       if x.endswith('.hdf')]
+    for c in candidates:
+        if os.path.isfile(c) and h5py.is_hdf5(c):
+            if c != coordfile:
+                print(" coord_file '{0}' is not an HDF5 file: reading the SOD2D "
+                      "coordinates from '{1}' instead".format(coordfile, c))
+            return c
+    raise FileNotFoundError(
+        "No HDF5 file with the SOD2D node coordinates found. Set coord_file to "
+        "a .hdf file of the Jacobian (dataset node_coords); tried: "
+        + ", ".join(candidates))
+
+
 def read_sod2d_coordinates(coordfile, rlength, beta, neq=5):
     """
     Read node coordinates from a SOD2D HDF5 file (dataset node_coords)
