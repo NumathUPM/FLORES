@@ -29,6 +29,7 @@ QUICK REFERENCE
 COORDINATES (one of these is required)
   Default .coo file  : JAC/samg.matrix.coo  (use --jac to change directory)
   TAU mesh NetCDF    : --mesh MESH/BFS_h4_2D.taumesh
+  SOD2D mesh HDF5    : --mesh MESH/back_facing.h5  [--bound-ids 3 4]
 
 INPUT (one of these is required)
   Single .pval file  : python plot_pval_eigfunction.py path/to/eigf_0_1.2j.pval
@@ -446,6 +447,115 @@ def load_taumesh(path, face_marker=None):
 
     return x, y, triang, body_contour, face_quads_solver
 
+
+
+def load_sod2dmesh(path, bound_ids=None):
+    """
+    Read a SOD2D HDF5 mesh (datasets coords, connec, boundFaces, boundFacesId)
+    and build the 2D triangulation of ONE z-plane (the lowest one).
+
+    The mesh is high order: each hexahedron has (p+1)^3 nodes. The nodes of an
+    element lying on the plane are triangulated locally (Delaunay of its
+    (p+1)^2 nodes), so the result does not depend on the node ordering inside
+    the element. The body contour is built from the boundary faces
+    (boundFaces): their nodes on the plane form lines, grouped by boundFacesId.
+
+    Returns the same tuple as load_taumesh:
+      x, y, triang, body_contour, None
+    with x, y the coordinates of the plane nodes, in the mesh ordering.
+    """
+    from scipy.spatial import Delaunay
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError('Reading a SOD2D mesh requires h5py (pip install h5py)')
+
+    print(f"  Reading SOD2D mesh: {path}")
+    with h5py.File(path, 'r') as f:
+        coords = np.asarray(f['coords'][:], dtype=np.float64)
+        connec = np.asarray(f['connec'][:], dtype=np.int64)
+        bfaces = (np.asarray(f['boundFaces'][:], dtype=np.int64)
+                  if 'boundFaces' in f else None)
+        bid    = (np.asarray(f['boundFacesId'][:], dtype=np.int64)
+                  if 'boundFacesId' in f else None)
+
+    nn  = len(coords)
+    npe = connec.shape[1]
+    # node numbering: 0-based or 1-based (Fortran)
+    base = 1 if connec.max() >= nn else 0
+    if base:
+        connec = connec - 1
+        if bfaces is not None:
+            bfaces = bfaces - 1
+    print(f"    nodes = {nn}   elements = {len(connec)}   nodes/element = {npe}   "
+          f"index base = {base}")
+
+    z    = coords[:, 2]
+    zmin = float(z.min())
+    ztol = 1e-6 * max(1.0, float(np.ptp(z)))
+    on_plane = np.abs(z - zmin) <= ztol
+
+    plane_nodes = np.flatnonzero(on_plane)
+    new_index   = np.full(nn, -1, dtype=np.int64)
+    new_index[plane_nodes] = np.arange(len(plane_nodes))
+    x = coords[plane_nodes, 0]
+    y = coords[plane_nodes, 1]
+    print(f"    plane z = {zmin:.6g}: {len(plane_nodes)} nodes   "
+          f"x∈[{x.min():.4g}, {x.max():.4g}]   y∈[{y.min():.4g}, {y.max():.4g}]")
+
+    # nodes per element on the plane: (p+1)^2 = npe^(2/3)
+    npl  = int(round(npe ** (2.0 / 3.0)))
+    mask = on_plane[connec]
+    elems = np.flatnonzero(mask.sum(axis=1) == npl)
+    if elems.size == 0:
+        raise ValueError(f"No element has {npl} nodes on the plane z={zmin}")
+    print(f"    elements touching the plane: {elems.size}   "
+          f"({npl} nodes each) -> triangulating", flush=True)
+
+    tris = []
+    for e in elems:
+        ids = connec[e][mask[e]]
+        loc = Delaunay(np.column_stack((coords[ids, 0], coords[ids, 1]))).simplices
+        tris.append(new_index[ids][loc])
+    tris = np.vstack(tris)
+
+    # drop degenerate triangles
+    a  = np.column_stack((x[tris[:, 1]] - x[tris[:, 0]], y[tris[:, 1]] - y[tris[:, 0]]))
+    b  = np.column_stack((x[tris[:, 2]] - x[tris[:, 0]], y[tris[:, 2]] - y[tris[:, 0]]))
+    ok = np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]) > 1e-14
+    tris = tris[ok]
+    print(f"    Total triangles: {len(tris)}")
+    triang = tri.Triangulation(x, y, tris)
+
+    # ── body contour from the boundary faces ────────────────────────────────
+    contours = []
+    if bfaces is not None and bid is not None and len(bfaces) > 0:
+        nline = int(round(npl ** 0.5))          # nodes per edge = p+1
+        segs  = {}
+        for face, code in zip(bfaces, bid):
+            ids = face[on_plane[face]]
+            if len(ids) != nline:               # face not crossing the plane
+                continue
+            pts = np.column_stack((coords[ids, 0], coords[ids, 1]))
+            # order the nodes along the line (farthest pair gives the direction)
+            d   = pts[:, None, :] - pts[None, :, :]
+            i, j = np.unravel_index(np.argmax((d ** 2).sum(-1)), (nline, nline))
+            t   = (pts - pts[i]) @ (pts[j] - pts[i])
+            pts = pts[np.argsort(t)]
+            segs.setdefault(int(code), []).append(
+                np.vstack((pts, [np.nan, np.nan])))   # NaN breaks the polyline
+        print("    Boundary ids on the plane (use --bound-ids to select):")
+        for code in sorted(segs):
+            c = np.vstack(segs[code])
+            print(f"      id {code:4d}: {len(segs[code]):5d} faces   "
+                  f"x∈[{np.nanmin(c[:,0]):.4g}, {np.nanmax(c[:,0]):.4g}]   "
+                  f"y∈[{np.nanmin(c[:,1]):.4g}, {np.nanmax(c[:,1]):.4g}]")
+            if bound_ids is None or code in bound_ids:
+                contours.append(c)
+    else:
+        print("    Body contour: no boundFaces in the file")
+
+    return x, y, triang, contours, None
 
 # ── pval reader ────────────────────────────────────────────────────────────────
 
@@ -950,7 +1060,13 @@ def parse_args():
                         'E.g. --neq 6 for SA turbulence models.')
 
     p.add_argument('--mesh', default=None,
-                   help='TAU NetCDF mesh file. E.g. --mesh MESH/BFS_h4_2D.taumesh')
+                   help='Mesh file: TAU NetCDF (--mesh MESH/BFS_h4_2D.taumesh) or '
+                        'SOD2D HDF5 (--mesh MESH/back_facing.h5, picked by the '
+                        '.h5/.hdf5 extension)')
+
+    p.add_argument('--bound-ids', nargs='+', type=int, default=None, metavar='ID',
+                   help='SOD2D mesh only: boundary ids (boundFacesId) to draw as '
+                        'body contour (default: all). The ids found are printed.')
 
     p.add_argument('--xlim', nargs=2, type=float, metavar=('XMIN', 'XMAX'),
                    default=None,
@@ -1056,7 +1172,11 @@ def main():
     if args.mesh is not None:
         if not os.path.isfile(args.mesh):
             print_usage_and_exit(f"mesh file not found: '{args.mesh}'")
-        x_tau, y_tau, mesh_triang, body_contour, mesh_quads = load_taumesh(args.mesh)
+        if args.mesh.lower().endswith(('.h5', '.hdf5', '.hdf')):
+            x_tau, y_tau, mesh_triang, body_contour, mesh_quads = \
+                load_sod2dmesh(args.mesh, bound_ids=args.bound_ids)
+        else:
+            x_tau, y_tau, mesh_triang, body_contour, mesh_quads = load_taumesh(args.mesh)
         if not os.path.isfile(coords_path):
             # No .coo: use TAU coordinates directly
             x, y = x_tau, y_tau
