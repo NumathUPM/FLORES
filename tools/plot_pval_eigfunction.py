@@ -599,10 +599,11 @@ def load_sod2dmesh_partitioned(path):
     print(f"    cell types (VTK id: count) = "
           f"{dict(zip(utypes.tolist(), utcount.tolist()))}   "
           f"connectivity ids / cell = {ncon_r.sum() / max(ncel_r.sum(), 1):g}")
-    # 12 = VTK_HEXAHEDRON, 11 = VTK_VOXEL (same nodes, different order)
-    if not np.isin(utypes, (11, 12)).all() or ncon_r.sum() != 8 * ncel_r.sum():
+    # 12 = VTK_HEXAHEDRON, 72 = VTK_LAGRANGE_HEXAHEDRON of order 1 (same 8
+    # corner nodes and order), 11 = VTK_VOXEL (same nodes, different order)
+    if not np.isin(utypes, (11, 12, 72)).all() or ncon_r.sum() != 8 * ncel_r.sum():
         raise ValueError(
-            "Only linear hexahedra (VTK type 12 or 11, 8 nodes per cell) are "
+            "Only linear hexahedra (VTK type 12, 72 or 11, 8 nodes per cell) are "
             f"supported. Found types {utypes.tolist()} and "
             f"{ncon_r.sum() / max(ncel_r.sum(), 1):g} connectivity ids per "
             "cell: the mesh must be written with isLinealOutput = 1")
