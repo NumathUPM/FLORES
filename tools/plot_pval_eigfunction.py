@@ -183,6 +183,12 @@ def load_coo(path, neq):
                 if node >= gridpoints:
                     break
 
+    if node < gridpoints:
+        print(f"  WARNING: header announces {gridpoints} nodes but the file "
+              f"only contains {node}; using those {node}.")
+        x = x[:node]
+        y = y[:node]
+
     print(f"    Loaded {node} nodes   "
           f"x∈[{x.min():.4g}, {x.max():.4g}]   "
           f"y∈[{y.min():.4g}, {y.max():.4g}]")
@@ -770,11 +776,11 @@ def omega_str(idx_omega):
 
 
 def eigenvalue_str(eigs, idx):
-    """Format eigenvalue for title: [-\sigma_r, \sigma_i] = [val, val]"""
+    r"""Format eigenvalue for title: [-\sigma_r, \sigma_i] = [val, val]"""
     if idx not in eigs:
         return ''
     lam = eigs[idx]
-    return f"[$-\sigma_r, \sigma_i$] = [{-lam.real:.5g}, {lam.imag:.5g}]"
+    return rf"[$-\sigma_r, \sigma_i$] = [{-lam.real:.5g}, {lam.imag:.5g}]"
 
 
 def compute_umag(data_dict):
@@ -1227,6 +1233,11 @@ def main():
                 print(f"  [skip] No data in '{forc_path}'.")
                 continue
             common = min(len(x), gridpoints)
+            if len(x) != gridpoints:
+                print(f"  WARNING: coord nodes ({len(x)}) != pval gridpoints "
+                      f"({gridpoints}). Truncating to {common}: the plot is only "
+                      f"correct if both files use the same node ordering "
+                      f"(check the .coo matches the Jacobian/domain reduction).")
             xi, yi = x[:common], y[:common]
             forc_data = truncate(forc_data, common)
             if cached_n_nodes != common:
