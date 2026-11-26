@@ -5,7 +5,11 @@ plot_pval_eigfunction.py
 Reads a .pval NetCDF file produced by mode2pval() and plots the
 eigenmode components on the 2D computational domain.
 
-Coordinate file (default: JAC/samg.matrix.coo)
+Coordinate file (default: samg.matrix.coo)
+  Searched first in the results directory (--dir, or the folder of the .pval
+  file): for SOD2D Jacobians eig_solver.py reads the coordinates from the
+  Jacobian file and dumps them there, matching the .pval files. If not found,
+  JAC/samg.matrix.coo (--jac) is used, as for TAU.
   Line 1  :  npoints_total   ndim
   Lines 2+:  x   y   (one row per DOF, neq rows per mesh node -> identical coords)
   -> unique grid nodes = npoints_total // neq
@@ -27,7 +31,8 @@ QUICK REFERENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 COORDINATES (one of these is required)
-  Default .coo file  : JAC/samg.matrix.coo  (use --jac to change directory)
+  Default .coo file  : <--dir>/samg.matrix.coo (SOD2D dump from eig_solver),
+                       else JAC/samg.matrix.coo (use --jac to change directory)
   TAU mesh NetCDF    : --mesh MESH/BFS_h4_2D.taumesh
 
 INPUT (one of these is required)
@@ -1009,7 +1014,15 @@ def main():
     mesh_quads   = None
 
     # Always load .coo for coordinates (correct node ordering for .pval)
-    coords_path = os.path.join(args.jac, 'samg.matrix.coo')
+    # SOD2D: eig_solver dumps the coords next to the modes -> prefer them
+    _coo_dirs = [d for d in [args.dir,
+                             os.path.dirname(os.path.abspath(args.pval))
+                             if args.pval else None,
+                             args.jac] if d]
+    coords_path = next((os.path.join(d, 'samg.matrix.coo') for d in _coo_dirs
+                        if os.path.isfile(os.path.join(d, 'samg.matrix.coo'))),
+                       os.path.join(args.jac, 'samg.matrix.coo'))
+    print(f"  Coordinate file: {coords_path}")
     if not os.path.isfile(coords_path):
         if args.mesh is None:
             print_usage_and_exit(
