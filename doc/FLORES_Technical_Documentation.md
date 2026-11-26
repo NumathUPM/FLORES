@@ -1378,7 +1378,7 @@ sensitivity).
   `neq` rows, or `--neq`), **or** a TAU mesh with `--mesh file.taumesh`. In
   the second case the TAU triangulation is remapped to the `.coo` order, with
   automatic scaling, and the body contour is drawn.
-- **SOD2D mesh (`--mesh MESH/back_facing.h5`):** chosen by the `.h5`/`.hdf5`
+- **SOD2D mesh (`--mesh MESH/back_facing.h5`):** chosen by the `.h5`
   extension. `load_sod2dmesh()` reads `coords`, `connec`, `boundFaces` and
   `boundFacesId`, takes the lowest $`z`$ plane and triangulates the
   $`(p+1)^2`$ nodes that each high-order element has on it (local Delaunay,

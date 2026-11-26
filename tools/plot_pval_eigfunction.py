@@ -1062,7 +1062,7 @@ def parse_args():
     p.add_argument('--mesh', default=None,
                    help='Mesh file: TAU NetCDF (--mesh MESH/BFS_h4_2D.taumesh) or '
                         'SOD2D HDF5 (--mesh MESH/back_facing.h5, picked by the '
-                        '.h5/.hdf5 extension)')
+                        '.h5 extension)')
 
     p.add_argument('--bound-ids', nargs='+', type=int, default=None, metavar='ID',
                    help='SOD2D mesh only: boundary ids (boundFacesId) to draw as '
@@ -1172,7 +1172,7 @@ def main():
     if args.mesh is not None:
         if not os.path.isfile(args.mesh):
             print_usage_and_exit(f"mesh file not found: '{args.mesh}'")
-        if args.mesh.lower().endswith(('.h5', '.hdf5', '.hdf')):
+        if args.mesh.lower().endswith('.h5'):
             x_tau, y_tau, mesh_triang, body_contour, mesh_quads = \
                 load_sod2dmesh(args.mesh, bound_ids=args.bound_ids)
         else:
