@@ -51,11 +51,11 @@ def read_control_file(filepath):
             vol_file        : volumes filename    (default: samg.matrix.vol)
             coord_file      : coordinates filename (default: samg.matrix.coo)
             simulator       : origin of the Jacobian, 'tau' or 'sod2d'
-                              (default: tau). TAU gives the Jacobian of the
-                              residual (dq/dt = -R), so its sign is flipped to
-                              get stable modes with Re(lambda) < 0, as in SOD2D.
-                              Shift, printed/stored eigenvalues and the
-                              duplicate check use the flipped convention.
+                              (default: tau). The SOD2D Jacobian has the
+                              opposite sign to TAU's, so it is flipped to follow
+                              the TAU convention. Shift, printed/stored
+                              eigenvalues and the duplicate check use the TAU
+                              convention. TAU is left untouched.
             sod2d_dumpfile  : SOD2D only: name of the .coo file written in
                               output_path with the (kept) node coordinates
                               (default: samg.matrix.coo)
@@ -491,8 +491,8 @@ def run_slices(params):
             amatrix, neq = open_sod2d_jacobian(input_path,jacfile)
         else:
             amatrix, neq = openjacobian(jacfile)
-        # TAU Jacobian is dR/dq with dq/dt = -R: flip it to match SOD2D (dq/dt = J q)
-        amatrix.data *= fac * (1.0 if is_simulator_sod2d else -1.0)
+        # SOD2D Jacobian has the opposite sign to TAU's: flip it to follow the TAU convention
+        amatrix.data *= fac * (-1.0 if is_simulator_sod2d else 1.0)
         nvars  = amatrix.shape[0]
         nnz    = amatrix.nnz
         meta   = np.array([neq, nvars, nnz], dtype=np.int64)
