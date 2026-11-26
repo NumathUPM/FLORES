@@ -57,7 +57,8 @@ def read_control_file(filepath):
                               eigenvalues and the duplicate check use the TAU
                               convention. TAU is left untouched.
             sod2d_dumpfile  : SOD2D only: name of the .coo file written in
-                              output_path with the (kept) node coordinates
+                              input_path (the JAC directory) with the node
+                              coordinates
                               (default: samg.matrix.coo)
 
         [physics]
@@ -428,7 +429,7 @@ def run_slices(params):
     volfile = os.path.join(input_path, params['vol_file'])
     coofile = os.path.join(input_path, params['coord_file'])
 
-    sod2d_dumpfile = os.path.join(output_path, params['sod2d_dumpfile'])
+    sod2d_dumpfile = os.path.join(input_path, params['sod2d_dumpfile'])
 
 
     fac = 1. / (mach * np.sqrt(1.4))

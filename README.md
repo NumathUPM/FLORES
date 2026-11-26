@@ -171,7 +171,7 @@ The eigenvalue solver can also read Jacobians exported by SOD2D (HDF5,
 `coord_file` to the `.hdf` file (with several `.hdf` files in `input_path`
 the Jacobian is read in the split parallel format). The mass matrix is the
 identity, and the node coordinates are written to
-`RESULTS_eig/samg.matrix.coo` for post-processing. See chapter 2.4 of the
+`JAC/samg.matrix.coo` (i.e. `input_path`) for post-processing. See chapter 2.4 of the
 [technical documentation](doc/FLORES_Technical_Documentation.md).
 
 ---

@@ -630,7 +630,7 @@ resolvent solver always expects TAU files.
 | Mass matrix $`\mathbf{M}`$ | cell volumes from `vol_file` | **identity** (no volumes are exported) |
 | Coordinates | `coord_file` (`.coo` text file, one row per DOF) | `coord_file` = an HDF5 file with `node_coords` (one row per node, columns $`x, y, z`$) |
 | Variables in `.pval` | `rho, u, w, e[, turb1, turb2]` | `rho, u, v, w, e` |
-| `.coo` for post-processing | the TAU one | written by FLORES to `output_path/sod2d_dumpfile` |
+| `.coo` for post-processing | the TAU one | written by FLORES to `input_path/sod2d_dumpfile` |
 | Resolvent | supported | **not supported** |
 
 The Mach scaling $`1/(M_\infty\sqrt{\gamma})`$ is applied to both.
@@ -675,7 +675,7 @@ input_path     = ./JAC_SOD2D/
 output_path    = ./RESULTS_eig/
 jac_file       = jacobian.hdf          # any .hdf of the Jacobian (single-file case)
 coord_file     = jacobian.hdf          # file with node_coords (any of the split files)
-sod2d_dumpfile = samg.matrix.coo       # default; written in output_path
+sod2d_dumpfile = samg.matrix.coo       # default; written in input_path (JAC)
 # vol_file is not used
 
 [physics]
@@ -706,7 +706,7 @@ zmax =  5.0
 - Domain reduction uses columns 0 and 1 of the coordinates. For SOD2D these
   are $`x`$ and $`y`$, so the keys `zmin`/`zmax` bound **y**.
 - FLORES writes the coordinates of the **full mesh** to
-  `output_path/sod2d_dumpfile` (header `ndof 3`, one `x y z` row per DOF),
+  `input_path/sod2d_dumpfile` (header `ndof 3`, one `x y z` row per DOF),
   matching the `.pval` files, which are always written on the full mesh.
   Plot with:
 
