@@ -595,9 +595,17 @@ def load_sod2dmesh_partitioned(path):
 
     nranks = len(npts_r)
     print(f"    ranks = {nranks}   points = {len(pts)}   cells = {ncel_r.sum()}")
-    if not (types == 12).all() or ncon_r.sum() != 8 * ncel_r.sum():
-        raise ValueError("Only linear hexahedra (VTK type 12) are supported: "
-                         "the mesh must be written with isLinealOutput = 1")
+    utypes, utcount = np.unique(types, return_counts=True)
+    print(f"    cell types (VTK id: count) = "
+          f"{dict(zip(utypes.tolist(), utcount.tolist()))}   "
+          f"connectivity ids / cell = {ncon_r.sum() / max(ncel_r.sum(), 1):g}")
+    # 12 = VTK_HEXAHEDRON, 11 = VTK_VOXEL (same nodes, different order)
+    if not np.isin(utypes, (11, 12)).all() or ncon_r.sum() != 8 * ncel_r.sum():
+        raise ValueError(
+            "Only linear hexahedra (VTK type 12 or 11, 8 nodes per cell) are "
+            f"supported. Found types {utypes.tolist()} and "
+            f"{ncon_r.sum() / max(ncel_r.sum(), 1):g} connectivity ids per "
+            "cell: the mesh must be written with isLinealOutput = 1")
 
     pstart = np.concatenate(([0], np.cumsum(npts_r)))
     cstart = np.concatenate(([0], np.cumsum(ncel_r)))
@@ -612,6 +620,11 @@ def load_sod2dmesh_partitioned(path):
         else:
             off = pstart[r]
         cells[cstart[r]:cstart[r + 1]] = (c + off).reshape(-1, 8)
+
+    # voxels (type 11) -> hexahedron node order
+    vox = types == 11
+    if vox.any():
+        cells[vox] = cells[vox][:, [0, 1, 3, 2, 4, 5, 7, 6]]
 
     z    = pts[:, 2]
     zmin = float(z.min())
