@@ -10,7 +10,8 @@ import gc
 import configparser
 from jac_red import domain_reduction
 from save2pval import mode2pval
-from input_output import openjacobian, read_coordinates
+from input_output import (openjacobian, read_coordinates, open_sod2d_jacobian,
+                          read_sod2d_coordinates, dump_sod2d_coordinates)
 from mpi_utils import assemble_aij, assemble_diag, ownership_ranges
 
 import petsc4py
@@ -48,6 +49,17 @@ def read_control_file(filepath):
             jac_file            : Jacobian filename    (default: samg.matrix.amg.pval)
             vol_file            : volumes filename     (default: samg.matrix.vol)
             coord_file          : coordinates filename (default: samg.matrix.coo)
+            simulator           : origin of the Jacobian, 'tau' or 'sod2d'
+                                  (default: tau). The SOD2D Jacobian has the
+                                  opposite sign to TAU's, so it is flipped to
+                                  follow the TAU convention (as in
+                                  eig_solver.py). SOD2D: the mass matrix is the
+                                  identity, beta must be 0, and the node
+                                  coordinates are read from coord_file (HDF5)
+                                  and written to sod2d_dumpfile.
+            sod2d_dumpfile      : SOD2D only: name of the .coo file written in
+                                  input_path with the node coordinates
+                                  (default: samg.matrix.coo)
 
         [physics]
             mach                : Mach number
@@ -95,6 +107,13 @@ def read_control_file(filepath):
                                     fallback='samg.matrix.vol').strip()
     params['coord_file']  = cfg.get('io', 'coord_file',
                                     fallback='samg.matrix.coo').strip()
+    params['sod2d_dumpfile'] = cfg.get('io', 'sod2d_dumpfile',
+                                       fallback='samg.matrix.coo').strip()
+    params['simulator']   = cfg.get('io', 'simulator',
+                                    fallback='tau').replace(' ', '').lower()
+    if params['simulator'] not in ('tau', 'sod2d'):
+        raise ValueError("[io] simulator must be 'tau' or 'sod2d', got "
+                         "'{0}'".format(params['simulator']))
 
     # [physics]
     params['mach']    = cfg.getfloat('physics', 'mach')
@@ -272,7 +291,8 @@ class resolvant_adjoint(object):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_sensitivity_field(direct_vec, adjoint_vec, B, nvars, n, neq,
-                               beta, dreduced, rgid, outfile, rank):
+                               beta, dreduced, rgid, outfile, rank,
+                               is_simulator_sod2d=False):
     """
     Compute and save the structural sensitivity field.
     sensitivity_i(x) = |q_adj_i(x)| * |q_dir_i(x)| / |<q_adj_i, B, q_dir_i>|
@@ -304,7 +324,8 @@ def compute_sensitivity_field(direct_vec, adjoint_vec, B, nvars, n, neq,
         wm_vec_np   = sensitivity.astype('c16')
         wm_petsc    = PETSc.Vec().createSeq(len(wm_vec_np))
         wm_petsc.setArray(wm_vec_np)
-        mode2pval(outfile, wm_petsc, nvars, n, neq, beta, dreduced, rgid)
+        mode2pval(outfile, wm_petsc, nvars, n, neq, beta, dreduced, rgid,
+                  is_simulator_sod2d)
         wm_petsc.destroy()
 
     scatter_d.destroy(); dir_seq.destroy()
@@ -346,9 +367,17 @@ def run_slices(params):
     xmin                = params['xmin'];  xmax = params['xmax']
     zmin                = params['zmin'];  zmax = params['zmax']
 
+    simulator           = params['simulator']
+    is_simulator_sod2d  = (simulator == 'sod2d')
+    if is_simulator_sod2d and beta != 0:
+        raise ValueError("simulator = sod2d is only supported with beta = 0: "
+                         "the spanwise compaction needs a multi-slice (TAU) "
+                         "Jacobian")
+
     jacfile = os.path.join(input_path, params['jac_file'])
     volfile = os.path.join(input_path, params['vol_file'])
     coofile = os.path.join(input_path, params['coord_file'])
+    sod2d_dumpfile = os.path.join(input_path, params['sod2d_dumpfile'])
 
     if rank == 0:
         if not os.path.isdir(output_path):
@@ -362,7 +391,7 @@ def run_slices(params):
     Print(' ========================================')
     Print(' Input path  : {0}'.format(input_path))
     Print(' Output path : {0}'.format(output_path))
-    Print(' Jacobian    : {0}'.format(jacfile))
+    Print(' Jacobian    : {0}  ({1})'.format(jacfile, simulator))
     Print(' Mach        : {0}'.format(mach))
     Print(' beta        : {0}'.format(beta))
     Print(' nev         : {0}'.format(nev))
@@ -385,7 +414,10 @@ def run_slices(params):
     t0 = time.time()
     Print(' Reading Jacobian')
     if rank == 0:
-        mjac, neq = openjacobian(jacfile)
+        if is_simulator_sod2d:
+            mjac, neq = open_sod2d_jacobian(input_path, jacfile)
+        else:
+            mjac, neq = openjacobian(jacfile)
         nvars     = mjac.shape[0]
         Print(' Matrix main dimension = {0}'.format(nvars))
         Print(' Number of equations   = {0}'.format(neq))
@@ -427,22 +459,27 @@ def run_slices(params):
 
     # ── Mass matrix ──────────────────────────────────────────────────────────
     t0 = time.time()
-    Print(' Reading mass matrix')
-    if rank == 0:
-        with open(volfile, 'r') as f:
-            vols_buf = np.array([float(line) for line in f.readlines()],
-                                dtype=np.float64)
-        ngp = np.array([len(vols_buf)], dtype=np.int64)
+    if is_simulator_sod2d:
+        # SOD2D: no cell volumes are exported, the mass matrix is the identity
+        Print(' SOD2D: mass matrix = identity')
+        b_data = np.ones(n, dtype=np.complex128)
     else:
-        ngp = np.empty(1, dtype=np.int64)
+        Print(' Reading mass matrix')
+        if rank == 0:
+            with open(volfile, 'r') as f:
+                vols_buf = np.array([float(line) for line in f.readlines()],
+                                    dtype=np.float64)
+            ngp = np.array([len(vols_buf)], dtype=np.int64)
+        else:
+            ngp = np.empty(1, dtype=np.int64)
 
-    comm.Bcast(ngp, root=0)
-    if rank != 0:
-        vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
-    comm.Bcast(vols_buf, root=0)
+        comm.Bcast(ngp, root=0)
+        if rank != 0:
+            vols_buf = np.empty(int(ngp[0]), dtype=np.float64)
+        comm.Bcast(vols_buf, root=0)
 
-    b_data = np.repeat(vols_buf, neq).astype(np.complex128)   # diag(M)
-    del vols_buf
+        b_data = np.repeat(vols_buf, neq).astype(np.complex128)   # diag(M)
+        del vols_buf
     _t(comm, rank, 'Mass matrix build', t0)
 
     # ── Domain reduction — rank 0 only; only vectors are broadcast ───────────
@@ -454,7 +491,10 @@ def run_slices(params):
         Print(' ZMIN/ZMAX = {0}/{1}'.format(zmin, zmax))
 
         if rank == 0:
-            coord = read_coordinates(coofile, rlength, beta)
+            if is_simulator_sod2d:
+                coord = read_sod2d_coordinates(coofile, rlength, beta, neq)
+            else:
+                coord = read_coordinates(coofile, rlength, beta)
             dr    = domain_reduction(zmin, zmax, xmin, xmax)
             dr.create_Pmatrix(coord)
 
@@ -486,6 +526,14 @@ def run_slices(params):
         n    = n_red
         rgid = rgid.astype(int)
 
+        # SOD2D: dump the full-mesh coordinates to a TAU-like .coo file
+        # (the .pval files are written on the full mesh)
+        if is_simulator_sod2d and rank == 0:
+            dump_sod2d_coordinates(sod2d_dumpfile, coord, neq)
+    elif is_simulator_sod2d and rank == 0:
+        coord = read_sod2d_coordinates(coofile, rlength, beta, neq)
+        dump_sod2d_coordinates(sod2d_dumpfile, coord, neq)
+
     _t(comm, rank, 'Domain reduction', t0)
 
     # ── Assemble PETSc matrices ───────────────────────────────────────────────
@@ -493,7 +541,9 @@ def run_slices(params):
     t0  = time.time()
     fac = 1. / (mach * np.sqrt(1.4))
     if rank == 0:
-        amatrix.data *= fac
+        # SOD2D Jacobian has the opposite sign to TAU's: flip it to follow
+        # the TAU convention (same as eig_solver.py)
+        amatrix.data *= fac * (-1.0 if is_simulator_sod2d else 1.0)
 
     A    = assemble_aij(comm, amatrix if rank == 0 else None, n)
     Print(' Assembled A (Jacobian)')
@@ -591,7 +641,7 @@ def run_slices(params):
                 scatter.scatter(eigpre, eigenvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
                     mode2pval(eigvecfile, eigenvec, nvars, n, neq,
-                              beta, dreduced, rgid)
+                              beta, dreduced, rgid, is_simulator_sod2d)
                 scatter.destroy(); eigenvec.destroy()
 
                 # Optimal response
@@ -602,7 +652,7 @@ def run_slices(params):
                 scatter_r.scatter(resppre, respvec, False, PETSc.Scatter.Mode.FORWARD)
                 if rank == 0:
                     mode2pval(respvecfile, respvec, nvars, n, neq,
-                              beta, dreduced, rgid)
+                              beta, dreduced, rgid, is_simulator_sod2d)
                 scatter_r.destroy(); respvec.destroy()
 
                 if adjoint and compute_sensitivity:
@@ -679,7 +729,7 @@ def run_slices(params):
                                       PETSc.Scatter.Mode.FORWARD)
                     if rank == 0:
                         mode2pval(adjvecfile, adjvec, nvars, n, neq,
-                                  beta, dreduced, rgid)
+                                  beta, dreduced, rgid, is_simulator_sod2d)
                     scatter_a.destroy(); adjvec.destroy()
 
                     if compute_sensitivity and i < len(direct_modes):
@@ -688,7 +738,7 @@ def run_slices(params):
                         compute_sensitivity_field(
                             direct_modes[i], eigpre_adj, B,
                             nvars, n, neq, beta, dreduced, rgid,
-                            wmfile, rank)
+                            wmfile, rank, is_simulator_sod2d)
                         if rank == 0:
                             print(' Saved sensitivity {0} -> {1}'.format(i, wmfile))
 

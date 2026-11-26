@@ -1525,7 +1525,7 @@ Review of branch `miguel_dev`. Ordered by impact.
 | 10 | `resolvent_solver.py` | $`\mathbf{P}`$ selects DOFs 1–2 (wrong for `beta ≠ 0`). | Choose the components according to `neq`/`beta`. |
 | 24 | `eig_solver.py` (SOD2D) | Mass matrix $`\mathbf{M}=\mathbf{I}`$: SOD2D does not export volumes. The code has a `TODO` about a factor 0.01 that used to multiply the identity. | Confirm the scaling of the SOD2D Jacobian (divided by the nodal mass or not), as for TAU's `Jacobian volume scaling`. |
 | 25 | `eig_solver.py` (SOD2D) | The Mach scaling $`1/(M_\infty\sqrt{\gamma})`$ of TAU is also applied to SOD2D. | Confirm SOD2D's non-dimensionalisation. |
-| 26 | `resolvent_solver.py` | No SOD2D support (`simulator` is not read). | Add the same reader switch and $`\mathbf{M}=\mathbf{I}`$; the forcing components for `rho, u, v, w, e` would be DOFs 1–3. |
+| 26 | `resolvent_solver.py` (SOD2D) | SOD2D support added (`simulator`, identity mass matrix, sign flip as in `eig_solver.py`, coordinates dumped to `input_path`). Only $`\beta=0`$ is supported (the spanwise compaction needs a multi-slice TAU Jacobian). The forcing acts on DOFs 1–2 (`u`, `v`: in-plane momentum), as for TAU in 2-D; the spanwise `w` (DOF 3) is not forced. | Extend to $`\beta\neq 0`$ and to forcing in `w` if 3-D analyses from SOD2D are needed. |
 | 27 | `input_output.py` (SOD2D) | The split format is inferred from the files (zeros in `col_ptr`, file-name order); a column with no non-zeros at the start of a file would be lost. | Have SOD2D write the global column range of each file. |
 
 ### 11.2 Fixed
