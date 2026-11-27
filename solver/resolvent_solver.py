@@ -189,8 +189,15 @@ class resolvant(object):
         """Build L = iw*I - A and perform LU factorization via MUMPS."""
         Print = PETSc.Sys.Print
         Print(' w = {0}'.format(w))
+        # L = w*I - A. MatShift is extremely slow (one malloc per missing
+        # diagonal entry, a practical hang for millions of rows) when A has
+        # rows without a stored diagonal, as the numerical SOD2D Jacobian does.
+        # MatAXPY with a diagonal matrix builds the new pattern in one pass.
         self.J.scale(-1.0)
-        self.J.shift(w)
+        Id = assemble_diag(np.ones(self.N, dtype=np.complex128), self.N)
+        self.J.axpy(w, Id,
+                    structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+        Id.destroy()
 
         self.ksp = PETSc.KSP().create()
         self.ksp.setOperators(self.J)
